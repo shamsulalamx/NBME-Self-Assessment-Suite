@@ -1,8 +1,11 @@
 # v4.85.2 — Quiz UI restructure + NBME lab-table renderer fix
 
-Status: **shipped to branch `phase12-vertex-migration`, tagged `-pending-validation`, packaged .app rebuilt. NOT user-verified yet.**
+Status: **USER-VERIFIED via click-through → promoted to `-stable` (2026-06-01).**
+Shipped to branch `phase12-vertex-migration`; both
+`v4.85.2-renderer-ui-labtables-pending-validation` and
+`v4.85.2-renderer-ui-labtables-stable` tags point at the verified code.
 
-Date: 2026-05-28
+Date: 2026-05-28 (shipped) · 2026-06-01 (verified + promoted)
 
 ## What this milestone contains
 
@@ -100,9 +103,11 @@ Quit (Cmd+Q) + relaunch the .app first.
 
 ## Promotion
 
-On user ✅ for Parts A + B, promote `v4.85.2-*-pending-validation` →
-`-stable`. Part C stays pending until a live generation confirms the elapsed
-display.
+DONE (2026-06-01): user click-through verified Parts A + B in the rebuilt .app
+(quiz UI in both normal and focus mode + lab tables rendering after re-import).
+`v4.85.2-renderer-ui-labtables-stable` tagged. Part C (BIC status-bar elapsed
+display) remains unverified until the next live generation run, but is
+crash-guarded and does not block the stable promotion.
 
 ## Known non-crashing limitations (carried, not regressions)
 

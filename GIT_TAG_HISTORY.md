@@ -6,7 +6,9 @@ This file documents stable v4 tags from v4.0 through the current head tag `v4.80
 
 Note on the recent v4.62–v4.80 batch: many of these tags shipped with source-level proof only (`node --check` clean + `.app` rebuilt + bundled-marker count). That is NOT verification of behavior, and several of those tags introduced regressions caught only when the user exercised the scenarios live. v4.80.1 codified this as a binding rule via the new `CLAUDE.md` working-agreement file: no `-stable` suffix without user click-through verification. v4.80.2 follows that rule — tag earned via real "Detected 1 NBME pair" UI confirmation by the user after re-selecting files in the rebuilt .app.
 
-## v4.85.2-renderer-ui-labtables-pending-validation
+## v4.85.2-renderer-ui-labtables-stable
+
+Promoted from `-pending-validation` on 2026-06-01 after the user click-through verified Parts A + B in the rebuilt .app: the 5 quiz UI changes in both normal and focus mode, and the NBME lab tables rendering correctly (no crash / no "shows previous question" symptom) after re-importing the regenerated JSONs. Both the `-pending-validation` and `-stable` tags point at the same verified commit (`c2cb585`). Part C (BIC status-bar elapsed display) remains unverified until a live generation run but is crash-guarded and did not block promotion.
 
 Commit: bundled `index.html` + `tools/nbme-pdf-json-generator/stem_lab_transformer.py` + `V4852_STATUS.md` + this entry, single v4.85.2 commit on `phase12-vertex-migration`.
 
