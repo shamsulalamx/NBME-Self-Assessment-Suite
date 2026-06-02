@@ -1,0 +1,78 @@
+You decide whether borrowing ONE real, published medical image from an
+open-access library would MEANINGFULLY deepen this question, and if so,
+what to SEARCH for.
+
+CRITICAL: You are NOT given any image, and you must NOT invent, guess, or
+output any URL, filename, or specific image. You output only a TEXT search
+query in medical terminology describing the finding to depict. A separate
+system performs the real image search.
+
+================================================================
+DEFAULT TO want=true WHEN AN OPPORTUNITY EXISTS
+================================================================
+The question's kernel has ALREADY screened this case and flagged
+IMAGE_OPPORTUNITY (see INPUTS) — a modality a real board exam would show
+with a canonical image. So when IMAGE_OPPORTUNITY is a real modality (not
+"none"), want=true is the EXPECTED answer. The image belongs in one of two
+places:
+  stem        - interpreting the image is itself part of reaching the answer
+                (reading the ECG / CXR / CT / smear / derm photo / etc.).
+  explanation - the image illustrates the teaching point after the answer
+                (a classic example of the entity being tested).
+Either one is a perfectly good reason to want the image.
+
+================================================================
+ONLY say want=false IF:
+================================================================
+- IMAGE_OPPORTUNITY is "none", OR
+- the image would be a generic algorithm, flowchart, or text table, OR
+- a picture would add nothing at all to either the stem or the teaching
+  point (genuinely text-only topic).
+Do NOT decline merely because the stem already states the finding in words
+— a classic illustrative image in the explanation is still valuable.
+
+================================================================
+IF want=true, WRITE THE QUERY (keep it SHORT)
+================================================================
+The image search ANDs every word, so long, hyper-specific queries match
+NOTHING. Write 2-4 COMMON terms, the way a textbook image file would be
+titled: put the DIAGNOSIS / FINDING FIRST and the MODALITY LAST. Use plain
+high-frequency words (e.g. "ECG" not "electrocardiogram", "MI" or
+"myocardial infarction" not "ST elevation II III aVF"). Good queries:
+  "myocardial infarction ECG"
+  "pneumonia chest x-ray"
+  "schistocytes blood smear"
+  "papilledema fundus"
+  "melanoma dermoscopy"
+  "gallstones ultrasound"
+  "appendicitis CT"
+AVOID: long clinical phrases, lead/segment names, eponyms, or laterality
+("inferior STEMI ST elevation II III aVF" → matches nothing).
+
+Choose placement (stem vs explanation) as defined above.
+
+================================================================
+OUTPUT (strict JSON, no markdown fences, no prose)
+================================================================
+{
+  "want": <true|false>,
+  "query": "<medical search query; empty string if want=false>",
+  "modality": "<ecg | chest x-ray | ct | mri | histology | peripheral smear | derm photo | fundoscopy | ultrasound | gross specimen | none>",
+  "placement": "<stem | explanation>",
+  "reason": "<one sentence>"
+}
+
+================================================================
+INPUTS
+================================================================
+STEM:
+{{STEM}}
+
+IMAGE_OPPORTUNITY (hint from the question's kernel):
+{{IMAGE_OPPORTUNITY}}
+
+CORRECT ANSWER CONCEPT:
+{{CORRECT_CONCEPT}}
+
+DISCRIMINATING CLUE IN STEM:
+{{DISCRIMINATING_CLUE}}

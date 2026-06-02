@@ -28,13 +28,37 @@ HARD CONSTRAINTS (your stem MUST satisfy ALL of these)
    pulmonary embolism. What is the diagnosis? → PE.").
 
 ================================================================
-ORDER DEFINITIONS (your TARGET_ORDER assignment is at the bottom)
+ORDER = REASONING DEPTH (your TARGET_ORDER assignment is at the bottom)
 ================================================================
-  first_order   5-8 sentences. Direct: "what is this / which structure"
-  second_order  6-10 sentences. Diagnose then act: "next best step"
+Order controls vignette LENGTH/DEPTH — not what is asked. TARGET_TASK
+(below) sets the question. Keep the depth but phrase the final question
+to match the TASK, NOT necessarily "next step in management".
+  first_order   5-8 sentences. A single clue resolves it.
+  second_order  6-10 sentences. The reader synthesizes 2+ findings, or
+                takes one decision after identifying the entity.
   third_order   8-12 sentences. May include a mid-vignette update
                 ("Two hours later, blood pressure remains 82/48 mm Hg
                 despite adequate fluid resuscitation").
+
+================================================================
+TASK → FINAL QUESTION PROMPT (your TARGET_TASK assignment is at the bottom)
+================================================================
+Phrase the stem's final "?" sentence to match TARGET_TASK:
+  diagnosis        "Which of the following is the most likely diagnosis?"
+  next_dx_step     "Which of the following is the most appropriate next
+                   step in diagnosis?" / "...most appropriate initial
+                   diagnostic study?"
+  next_mgmt_step   "Which of the following is the most appropriate next
+                   step in management?"
+  mechanism        "Which of the following best explains the underlying
+                   mechanism of this patient's condition?"
+  causative_agent  "Which of the following is the most likely causal
+                   organism?" / "...underlying cause?"
+  expected_finding "Which of the following findings is most likely to be
+                   present in this patient?"
+  complication     "Which of the following is the most likely
+                   complication?"
+Do NOT use a management prompt unless TARGET_TASK is next_mgmt_step.
 
 ================================================================
 STYLE — NBME / UWORLD AUTHENTICITY
@@ -84,7 +108,9 @@ SLIDE_CONTEXT:
 PER-QUESTION INPUTS (vary per question — keep at the END so the
 prefix above stays cache-stable across questions of the same allocation)
 ================================================================
-TARGET_ORDER (mandatory): {{TARGET_ORDER}}
+TARGET_TASK (mandatory — phrase the final question to match this): {{TARGET_TASK}}
+
+TARGET_ORDER (mandatory — reasoning depth only): {{TARGET_ORDER}}
 
 TARGET_DIFFICULTY (mandatory): {{TARGET_DIFFICULTY}}
 

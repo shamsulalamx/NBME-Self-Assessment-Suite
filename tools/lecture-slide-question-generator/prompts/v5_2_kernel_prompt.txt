@@ -15,13 +15,68 @@ the distractors are designed in lockstep so the discriminator is
 provably present and provably specific.
 
 ================================================================
-ORDER DEFINITIONS (your TARGET_ORDER assignment is at the bottom)
+ORDER = REASONING DEPTH ONLY (your TARGET_ORDER assignment is at the bottom)
 ================================================================
-  first_order:   single-step recall (diagnose, name structure)
-  second_order:  diagnose → next best step in management
-  third_order:   multi-step layered reasoning (failed first-line,
-                 complication on top of disease, comorbidity changing
-                 management)
+Order is HOW MANY inferential steps the reader takes — NOT what the
+question asks. Order is INDEPENDENT of TASK (below): a "most likely
+diagnosis" question can be third_order, and a "next step in management"
+question can be first_order. Do not let the order push you toward a
+management question — TARGET_TASK decides what is asked.
+  first_order:   the answer follows from ONE recognition/recall step
+                 (a single clue resolves it).
+  second_order:  the reader must synthesize 2+ findings, or take one
+                 decision after first identifying the underlying entity.
+  third_order:   multi-step layered reasoning — a failed first-line, a
+                 complication layered on the disease, or a comorbidity
+                 that changes the answer.
+
+================================================================
+TASK = WHAT THE QUESTION ASKS (your TARGET_TASK assignment is at the bottom)
+================================================================
+TARGET_TASK dictates what the correct answer IS. Design
+correctAnswerConcept (and the discriminating clue + distractors around
+it) to serve this task.
+
+CRITICAL — DEFEAT THE DEFAULT. The natural pull is to make every vignette
+a "most likely diagnosis" or "next step in management" question. RESIST IT.
+If TARGET_TASK is mechanism, causative_agent, expected_finding, or
+complication, your correctAnswerConcept MUST be of that type and NOTHING
+else:
+  - mechanism        → a pathophysiologic process or drug MOA
+                       (e.g. "decreased ADH action at the collecting duct"),
+                       NOT a disease name and NOT a treatment.
+  - causative_agent  → a named organism or specific etiology
+                       (e.g. "Streptococcus pneumoniae"), NOT a diagnosis.
+  - expected_finding → an associated exam/lab/imaging finding
+                       (e.g. "elevated serum gastrin"), NOT the diagnosis.
+  - complication     → a downstream complication or outcome
+                       (e.g. "ascending cholangitis"), NOT the primary dx.
+A kernel whose correctAnswerConcept is a diagnosis or a treatment when
+TARGET_TASK is one of those four is WRONG — redesign it. Likewise, do NOT
+produce a "next step in management" answer unless TARGET_TASK is
+next_mgmt_step.
+  diagnosis         Correct answer = the most likely DIAGNOSIS. The stem
+                    asks "Which is the most likely diagnosis?"
+  next_dx_step      Correct answer = the most appropriate NEXT DIAGNOSTIC
+                    study (best-initial vs most-accurate test, or the next
+                    test in the workup). Asks "Which is the most
+                    appropriate next step in diagnosis / workup?"
+  next_mgmt_step    Correct answer = the most appropriate NEXT TREATMENT or
+                    management action. Asks "Which is the most appropriate
+                    next step in management?"
+  mechanism         Correct answer = the underlying PATHOPHYSIOLOGY of the
+                    disease OR a drug's MECHANISM of action. Asks "Which
+                    best explains the underlying mechanism?"
+  causative_agent   Correct answer = the most likely ORGANISM / etiologic
+                    agent / cause. Asks "Which is the most likely causal
+                    organism (or underlying cause)?"
+  expected_finding  Correct answer = the exam / lab / imaging FINDING most
+                    likely to be present (an association, not the
+                    diagnosis itself). Asks "Which finding is most likely
+                    to be present?"
+  complication      Correct answer = the most likely COMPLICATION or the
+                    expected prognosis / outcome. Asks "Which is the most
+                    likely complication?"
 
 ================================================================
 DIFFICULTY DEFINITIONS (your TARGET_DIFFICULTY assignment is at the bottom)
@@ -82,13 +137,13 @@ ANTI-PATTERNS — if any of these would apply, you must REDESIGN
 OUTPUT (strict JSON, no markdown fences, no prose)
 ================================================================
 {
-  "correctAnswerConcept": "<semantic concept e.g. 'inferior wall MI from right coronary artery occlusion' or 'IV ceftriaxone empirically'>",
+  "correctAnswerConcept": "<semantic concept whose TYPE matches TARGET_TASK (diagnosis→a disease; next_dx_step→a test; next_mgmt_step→a treatment; mechanism→a pathophysiology/MOA; causative_agent→an organism; expected_finding→an associated finding; complication→a downstream outcome). e.g. 'inferior wall MI from right coronary artery occlusion' or 'IV ceftriaxone empirically'>",
   "discriminatingClueInStem": "<the SPECIFIC clinical detail (~10-30 words) the stem must contain — this is what resolves the question, e.g. 'ST elevations in leads II, III, and aVF' or 'right arm BP 152/94, right leg BP 108/70'>",
   "rationale": "<3-5 sentences that (1) name the mechanism or pathophysiology behind the correct answer, (2) restate the specific discriminating clue from the stem, and (3) explain how that clue mechanistically resolves to this answer. This becomes the test-taker's 'Correct Answer Explanation' — write it as you would teach a Step 2 CK student why THIS stem maps to THIS answer.>",
   "retrievalTag": "<hyperspecific search tag, UNDER 12 WORDS, naming diagnosis + key feature + management or context. NOT a vague topic like 'psychiatry' or 'cardiology'. Examples: 'Lithium toxicity presenting with tremor and confusion in bipolar disorder' / 'Stable angina management with low-dose aspirin and beta-blocker' / 'Pulmonary embolism with elevated D-dimer requiring CT angiography'. This is what the student types to RE-FIND this question later.>",
   "reviewPearl": "<ONE concise sentence stating the SINGLE high-yield testable rule a board student would highlight. Imperative or declarative voice. Examples: 'Withdraw the antidepressant and start a mood stabilizer in bipolar II depression' / 'CT pulmonary angiography is the first imaging step when D-dimer is elevated and probability is intermediate-to-high' / 'Cardioselective beta-blockers (metoprolol, atenolol) are preferred over nonselective in patients with reactive airway disease'. NOT a paragraph; NOT a definition; the FACT itself.>",
   "educationalObjective": "<the specific reasoning task this question tests, ≤20 WORDS. Starts with an action verb. Examples: 'Identify management of bipolar II depression in a patient with prior hypomanic episode' / 'Determine first-line antihypertensive in a patient with coexisting CKD and diabetes' / 'Recognize ECG findings of acute inferior wall MI'. NOT the answer; the COGNITIVE TASK.>",
-  "imageOpportunity": "<ECG | chest x-ray | CT | MRI | histology | derm photo | peripheral smear | fundoscopy | ultrasound | gross specimen | none>",
+  "imageOpportunity": "<Name a modality HERE whenever the correct diagnosis is one a real exam WOULD show with a canonical/pathognomonic image the reader could interpret — and seeing it would genuinely help answer THIS question (not decoration). Typical mappings: ECG (arrhythmia, ACS/STEMI, blocks), chest x-ray (pneumonia, effusion, pneumothorax, CHF, mass), CT (stroke, PE, appendicitis, aneurysm, intracranial bleed), MRI (cord compression, MS, brain/soft-tissue lesion), histology or gross specimen (characteristic pathology), peripheral smear (hemolysis, leukemia/lymphoma, malaria, sickle cell), derm photo (characteristic rash or skin lesion), fundoscopy (papilledema, diabetic/hypertensive retinopathy, CRAO), ultrasound (gallstones, DVT, AAA, effusion, ectopic). If the answer is reached purely from history/exam/labs with no canonical image, use 'none'. Be honest but NOT timid — image-rich diagnoses SHOULD get a modality. Exactly one of: ECG | chest x-ray | CT | MRI | histology | derm photo | peripheral smear | fundoscopy | ultrasound | gross specimen | none>",
   "distractors": [
     {
       "trapCategory": "COMPETING_DIAGNOSIS",
@@ -147,7 +202,9 @@ SLIDE_CONTEXT:
 PER-QUESTION ASSIGNMENT (varies per question — keep at the END so the
 prefix above stays cache-stable across questions of the same allocation)
 ================================================================
-TARGET_ORDER (mandatory): {{TARGET_ORDER}}
+TARGET_TASK (mandatory — dictates what the correct answer IS): {{TARGET_TASK}}
+
+TARGET_ORDER (mandatory — reasoning depth only, independent of task): {{TARGET_ORDER}}
 
 TARGET_DIFFICULTY (mandatory): {{TARGET_DIFFICULTY}}
 

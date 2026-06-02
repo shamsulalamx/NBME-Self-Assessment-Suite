@@ -1,9 +1,11 @@
 # BATCH 5 — Organic generator quality overhaul (v5)
 
 Branch: `phase12-vertex-migration`
-Tag: `v5.8-batch5-pending-validation` (latest). v5.6.1 is the most
-recent `-stable`; v5.7 + v5.8 await the user's running queue
-completing before `.app` rebuild + smoke + `-stable` promotion.
+Tag: `v5.9-batch5-pending-validation` (latest). v5.6.1 is the most
+recent `-stable`; v5.7 + v5.8 + v5.9 await `-stable` promotion.
+v5.9 WAS user-verified on a rebuilt `.app` — both the image-in-stem
+fix and the task-variety fix confirmed on a live OME run — so its
+promotion to `-stable` only awaits the user's explicit go-ahead.
 
 ## Scope (very important): organic-generation only
 
@@ -49,6 +51,7 @@ shipped in `v4.85-batch4-stable`.
 | `v5.6.1-batch5-stable` | **v5.6.1 bugfix: retrievalTag / reviewPearl / educationalObjective were all the same string.** Pre-v5.6.1 the OME adapter routed all three through `kernel.correctAnswerConcept` because the kernel didn't emit distinct fields. v5.6.1 adds them to the kernel JSON spec and reads them directly. Bug present since v5.3; user-caught during v5.6 inspection. **User verified the full v5.3 → v5.6.1 stack on the rebuilt .app and promoted all six to `-stable`.** |
 | `v5.7-batch5-pending-validation` | Advanced Mode for Fast Facts PPTX + Emma Holliday PDF. Registry config for Fast Facts; registry + `--v5` flag forwarding in `emma_profile_runner.py`. UI gates chunk-size + Q-per-chunk knobs on new `supportsChunkControls` registry flag (OME-only today). Group B deferred. Code shipped; `.app` rebuild + smoke + `-stable` deferred until user's running queue completes. |
 | `v5.8-batch5-pending-validation` | **Advanced Mode for all of Group B (UWorld notes + Mehlman PDF + Anki notes + Divine podcasts).** OME's v5.3 adapter promoted to shared `tools/shared-ingestion/v5_uworld_family_adapter.py` with a `process_file_v5_uworld_family()` helper. Each Group B generator + profile runner now accepts `--v5` flags. Registry: supportsAdvancedMode + advancedArgs for all 4 sources; supportsChunkControls for UWorld/Anki/Divine (Mehlman hides chunk knobs because its legacy CLI already owns `--questions-per-chunk`). Code shipped; same deferral as v5.7. |
+| `v5.9-batch5-pending-validation` | **Two user-caught bugs on the organic Advanced Mode pipeline, both fixed in CODE (not prompt nudges).** (1) **Image-in-stem:** borrowed external images appeared ONLY in answer explanations, never in stems — even when the stem's discriminating clue literally cited the image ("an abdominal radiograph shows…"), producing questions referencing an invisible film. Root cause: Stage 8b set `placement` from the model's choice, which was "explanation" 100% of the time. Fix: placement now decided in code via `stem_references_image()` (regex over the stem + discriminating clue) → STEM when the vignette cites an image, EXPLANATION otherwise. (2) **Task variety:** every question was "next step in management/diagnosis"; the four low-weight tasks (mechanism, causative_agent, expected_finding, complication) never appeared. Root cause: `plan_allocation_slots` ran PER CHUNK with a small n (~3), so largest-remainder rounding funded only the top-3 weighted tasks and zeroed the other four in every chunk. Fix: plan all three dimensions GLOBALLY across the whole deck, then deal slots to chunks by cursor. Partner prompt edits separate ORDER (reasoning depth) from TASK (what is asked) and thread `{{TARGET_TASK}}` into the kernel + stem prompts so the correct answer + final question match the assigned task. Also: `.q-img-credit` attribution line under borrowed images (CC BY/BY-SA), `external_image_source.py` query-ladder + retry, and `targetTask` recorded in v5 debug artifacts. Single shared `v5_pipeline.py` — all organic generators (OME, UWorld, Mehlman, Anki, Divine, lecture-slide) inherit both fixes; NBME/AMBOSS verbatim untouched. **User verified both fixes on a rebuilt `.app` (live OME run): "everything looks good."** |
 
 ## v5.3 — OME organic generator port
 
@@ -1272,3 +1275,114 @@ assumes text grounding (`fullText`, `clinicalFacts`,
 `primaryConcepts`). Image grounding needs a redesign of the kernel
 + stem prompts to accept image-derived facts as the source signal.
 Closer to a v6 design than a port. Stays out until that's spec'd.
+
+## v5.9 — image-in-stem fix + global task-variety fix
+
+Two bugs the user hit on a live OME run, reported with justified
+frustration after two prior "fixes" of mine that were prompt nudges
+and could not work. Both root causes are deterministic CODE bugs, and
+both are now fixed in code and proven against the user's real run data.
+
+### Bug 1 — borrowed images only ever landed in explanations
+
+**Symptom (user):** "Images are appearing in answer explanation. NOT A
+SINGLE IMAGE ON QUESTION STEM." Borrowed external (Wikimedia) images
+showed up exclusively in the answer explanation — even when the stem's
+discriminating clue explicitly referenced the image (e.g. "an abdominal
+radiograph shows…"), which produced a broken question citing a film the
+reader could not see.
+
+**Root cause:** Stage 8b (`external_image_source` routing) set
+`external_media["placement"]` from the model's own choice
+(`eq.get("placement")`), and the model picked `"explanation"` 100% of
+the time regardless of whether the stem depended on the image.
+
+**Fix (code, not prompt):** placement is now decided in code.
+`v5_pipeline.py` adds `_IMAGE_REFERENCE_RE` + `stem_references_image()`
+(line ~699/711), a regex over the stem **and** the discriminating clue
+covering imaging modalities (radiograph/x-ray/CT/MRI/ultrasound/ECG),
+tissue (smear/biopsy/histology), and visual cues (fundus/derm/gross
+specimen/"shown below"). Stage 8b (line ~1169) computes:
+
+```python
+_stem_ref = stem_references_image(stem_obj["stem"],
+                                  kernel.get("discriminatingClueInStem", ""))
+_placement = "stem" if (_stem_ref or eq.get("placement") == "stem") else "explanation"
+external_media = {**ext, "placement": _placement}
+```
+
+So a vignette that cites an image gets the image IN THE STEM; everything
+else keeps the image in the explanation. Verified against the user's real
+clues: 4 → STEM, 5 → EXPLANATION (images now appear in BOTH places).
+
+**Render side (`index.html`):** borrowed images carry license metadata,
+so a `.q-img-credit` line (CC BY / CC BY-SA attribution) now renders
+under any image with `img.external` — gated so the user's own source
+figures never get a caption. All attribution text via `textContent`
+(values come from an external API), never `innerHTML`.
+
+### Bug 2 — every question was "next step in management/diagnosis"
+
+**Symptom (user):** questions were ONLY next-step-in-management or
+next-step-in-diagnosis. The four exotic tasks — `mechanism`,
+`causative_agent`, `expected_finding`, `complication` — never appeared,
+across many runs.
+
+**Root cause:** `plan_allocation_slots` was called **per chunk** with
+that chunk's small `questionCount` (~3). The largest-remainder (Hare
+quota) rounding inside a small n funds only the top-3 weighted tasks; the
+four low-weight tasks (mechanism 0.16, causative_agent 0.10,
+expected_finding 0.10, complication 0.06) round to ZERO in every chunk.
+My two earlier "fixes" were kernel-prompt nudges ("DEFEAT THE DEFAULT") —
+useless, because the kernel was never even *assigned* those tasks; the
+planner deleted them upstream.
+
+**Fix (code):** plan all three independent dimensions (order, difficulty,
+task) **globally over the deck total**, then deal slots to chunks by a
+cursor (`v5_pipeline.py` line ~1285):
+
+```python
+total_slots = sum(chunk_counts)
+global_plan = plan_allocation_slots(total_slots, target_order_mix,
+                                    target_difficulty_mix, target_task_mix, seed=seed)
+# ...deal global_plan[cursor:cursor+count] to each chunk...
+```
+
+`plan_allocation_slots` now has exactly ONE call site. Proven offline:
+7 chunks of 3 planned per-chunk → only the top-3 tasks ever; one global
+n=21 → all 7 tasks present.
+
+**Partner prompt edits** (`v5_2_kernel_prompt.txt`, `v5_2_stem_prompt.txt`):
+ORDER is redefined as reasoning depth ONLY, fully independent of TASK;
+all 7 tasks get explicit definitions; the kernel must shape
+`correctAnswerConcept` to match `{{TARGET_TASK}}` (mechanism → a
+pathophysiology/MOA, causative_agent → an organism, etc.), and the stem
+must phrase its final question to match the task. These are necessary
+because the planner now actually assigns the exotic tasks — the prompts
+had to learn what to do with them. `targetTask` is also now recorded in
+the `_v5_2` debug artifact (was showing "?").
+
+### Scope / cross-platform
+
+Both fixes live in the single shared
+`tools/lecture-slide-question-generator/v5_pipeline.py` (the only copy in
+the tree — no per-tool forks). Every organic generator imports it: OME,
+lecture-slide, the shared UWorld-family adapter (UWorld / Mehlman / Anki /
+Divine), the Emma / Fast-Facts ingestion runner, and the batch-import
+dispatcher. No caller overrides `target_task_mix`, so all inherit the
+fixed global default. NBME and AMBOSS verbatim extraction never call
+`generate_v5` and are untouched.
+
+### Verification at ship
+
+- `python3 -m py_compile` clean on `v5_pipeline.py` + `external_image_source.py`.
+- All four fix markers present in source (helper 699/711, placement
+  1169/1172, global plan 1285/1297/1308, `targetTask` 882; single
+  `plan_allocation_slots` call site).
+- Source ↔ packaged-bundle MD5 **match** on all six runtime files
+  (`v5_pipeline.py`, `external_image_source.py`, `v5_external_image_query_prompt.txt`,
+  `v5_2_kernel_prompt.txt`, `v5_2_stem_prompt.txt`, `index.html`) — the
+  `.app` the user validated is byte-identical to what shipped.
+- **User click-through:** verified both fixes on the rebuilt `.app` via a
+  live OME run — "everything looks good." `-pending-validation` suffix
+  held per CLAUDE.md until the user explicitly approves `-stable`.

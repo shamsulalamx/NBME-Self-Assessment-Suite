@@ -1163,6 +1163,13 @@ mark.hl-pink   { background: #f48fb1; color: inherit; }
   box-shadow: none;
   margin: 0 auto;
 }
+/* Credit line shown ONLY under borrowed external images (img.external) so
+   CC BY / CC BY-SA attribution is displayed; never appears on source figures. */
+.q-img-credit {
+  font-size: 11px; color: #8a8a8a; text-align: center;
+  margin-top: 3px; line-height: 1.3; word-break: break-word;
+}
+.q-img-credit a { color: #8a8a8a; text-decoration: underline; }
 .q-stem-image-mode #q-stem,
 .rev-stem-image-mode #rev-stem { display: none; }
 
@@ -7140,6 +7147,32 @@ function renderStoredImagesInto(images, dest) {
     el.alt = img.isLabTable ? 'Lab values/table exhibit' : 'Clinical image';
     wrap.appendChild(el);
     dest.appendChild(wrap);
+
+    // Borrowed external images carry license/attribution metadata; CC BY / CC
+    // BY-SA require crediting the source. Gated on img.external so the user's
+    // own source figures never get a caption. All text via textContent (the
+    // values originate from an external API) — never innerHTML.
+    if (img.external && (img.attribution || img.sourceName || img.license)) {
+      const credit = document.createElement('div');
+      credit.className = 'q-img-credit';
+      const parts = [];
+      if (img.attribution) parts.push(String(img.attribution));
+      if (img.license) parts.push(String(img.license));
+      credit.textContent = parts.join(' · ');
+      if (img.sourceName) {
+        if (parts.length) credit.appendChild(document.createTextNode(' · '));
+        const src = String(img.sourceUrl || '');
+        if (/^https?:\/\//i.test(src)) {
+          const a = document.createElement('a');
+          a.href = src; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.textContent = String(img.sourceName);
+          credit.appendChild(a);
+        } else {
+          credit.appendChild(document.createTextNode(String(img.sourceName)));
+        }
+      }
+      wrap.appendChild(credit);
+    }
 
     if (img.dataUrl) {
       el.src = img.dataUrl;

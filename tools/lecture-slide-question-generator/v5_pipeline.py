@@ -65,6 +65,8 @@ Each per-Q debug trace lands under output_json/v5_debug/Q####.json.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import math
 import os
@@ -88,9 +90,11 @@ DISTRACTOR_PROMPT_PATH = PROMPT_DIR / "v5_2_distractors_prompt.txt"
 CRITIC_PROMPT_PATH = PROMPT_DIR / "v5_2_critic_prompt.txt"
 REGEN_PROMPT_PATH = PROMPT_DIR / "v5_2_regen_distractor_prompt.txt"
 IMAGE_PROMPT_PATH = PROMPT_DIR / "v5_image_routing_prompt.txt"
+EXTERNAL_IMAGE_PROMPT_PATH = PROMPT_DIR / "v5_external_image_query_prompt.txt"
 
 DEBUG_DIR = SCRIPT_DIR / "output_json" / "v5_debug"
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+EXTERNAL_IMAGE_CACHE_DIR = SCRIPT_DIR / "output_json" / "external_image_cache"
 
 # Models — v5.6 cost optimization (Lever 3 retry).
 #
@@ -260,9 +264,10 @@ def plan_allocation_slots(
     allocation_question_count: int,
     target_order_mix: dict[str, float],
     target_difficulty_mix: dict[str, float],
+    target_task_mix: dict[str, float],
     *,
     seed: int = 0,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     n = max(0, int(allocation_question_count))
     if n == 0:
         return []
@@ -271,15 +276,26 @@ def plan_allocation_slots(
     order_counts = _largest_remainder(target_order_mix, n)
     diff_keys = list(target_difficulty_mix.keys())
     diff_counts = _largest_remainder(target_difficulty_mix, n)
+    task_keys = list(target_task_mix.keys())
+    task_counts = _largest_remainder(target_task_mix, n)
     order_seq: list[str] = []
     for k, c in zip(order_keys, order_counts):
         order_seq.extend([k] * c)
     diff_seq: list[str] = []
     for k, c in zip(diff_keys, diff_counts):
         diff_seq.extend([k] * c)
+    task_seq: list[str] = []
+    for k, c in zip(task_keys, task_counts):
+        task_seq.extend([k] * c)
+    # The three dimensions are shuffled INDEPENDENTLY so reasoning depth
+    # (order), difficulty, and question TASK are decorrelated — a "most likely
+    # diagnosis" slot can land on a third-order vignette, a "mechanism" slot on
+    # an easy one, etc. This is what breaks the old management monoculture:
+    # task is no longer a side effect of order.
     rng.shuffle(order_seq)
     rng.shuffle(diff_seq)
-    return list(zip(order_seq, diff_seq))
+    rng.shuffle(task_seq)
+    return list(zip(order_seq, diff_seq, task_seq))
 
 
 def _largest_remainder(mix: dict[str, float], n: int) -> list[int]:
@@ -302,6 +318,7 @@ def stage_kernel(
     *,
     target_order: str,
     target_difficulty: str,
+    target_task: str,
     allowed_terms: list[str],
     allowed_distractor_pool: list[str],
     slide_context: dict[str, Any],
@@ -312,6 +329,7 @@ def stage_kernel(
         prompt
         .replace("{{TARGET_ORDER}}", target_order)
         .replace("{{TARGET_DIFFICULTY}}", target_difficulty)
+        .replace("{{TARGET_TASK}}", target_task)
         .replace("{{ALLOWED_TERMS_JSON}}", json.dumps(allowed_terms, ensure_ascii=False))
         .replace("{{ALLOWED_DISTRACTOR_POOL_JSON}}", json.dumps(allowed_distractor_pool, ensure_ascii=False))
         .replace("{{SLIDE_CONTEXT_JSON}}", json.dumps(slide_context, ensure_ascii=False))
@@ -347,6 +365,7 @@ def stage_stem(
     kernel: dict[str, Any],
     target_order: str,
     target_difficulty: str,
+    target_task: str,
     allowed_terms: list[str],
     slide_context: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -355,6 +374,7 @@ def stage_stem(
         prompt
         .replace("{{TARGET_ORDER}}", target_order)
         .replace("{{TARGET_DIFFICULTY}}", target_difficulty)
+        .replace("{{TARGET_TASK}}", target_task)
         .replace("{{KERNEL_JSON}}", json.dumps(kernel, ensure_ascii=False))
         .replace("{{ALLOWED_TERMS_JSON}}", json.dumps(allowed_terms, ensure_ascii=False))
         .replace("{{SLIDE_CONTEXT_JSON}}", json.dumps(slide_context, ensure_ascii=False))
@@ -542,6 +562,238 @@ def stage_image_route(
     return parsed
 
 
+# ── Stage 8b: source-image media builder (Phase 1) ──────────────────────────
+
+
+def _v5_data_url(path: Path, mime: str | None) -> str:
+    actual_mime = mime or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{actual_mime};base64,{encoded}"
+
+
+def _resolve_v5_asset_path(asset_path_str: str) -> Path | None:
+    raw = (asset_path_str or "").strip()
+    if not raw:
+        return None
+    for cand in (Path(raw), SCRIPT_DIR / raw, SCRIPT_DIR.parent / raw):
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def build_v5_source_media(
+    image_route: dict[str, Any] | None,
+    allocation: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Turn the Stage-8 routing decision into renderable image entries drawn
+    from the slide's already-extracted SOURCE figures.
+
+    The app's Landing-JSON import (_persistLandingJsonInlineImages in
+    index.html) moves each entry's base64 ``dataUrl`` into FigureStore and the
+    quiz renderer shows it, so all we emit here is the data URL + placement.
+
+    Text-only sources (uWorld, Anki, Divine, OME) carry no slideImages, so
+    Stage 8 already returns attach=False for them and this returns empty —
+    their source-ingestion path is never touched. A missing/unreadable asset
+    degrades to "no image" rather than raising: a dropped figure is
+    acceptable, crashing the run is not.
+    """
+    images: list[dict[str, Any]] = []
+    explanation_images: list[dict[str, Any]] = []
+    figure_refs: list[dict[str, Any]] = []
+    if not (image_route and image_route.get("attach")):
+        return images, explanation_images, figure_refs
+    image_id = str(image_route.get("imageId") or "").strip()
+    placement = str(image_route.get("placement") or "").strip().lower()
+    if not image_id or placement not in {"stem", "explanation"}:
+        return images, explanation_images, figure_refs
+    slide_images = allocation.get("slideImages") or []
+    img = next(
+        (i for i in slide_images if str(i.get("imageId") or "") == image_id),
+        None,
+    )
+    if not img:
+        return images, explanation_images, figure_refs
+    asset_path = _resolve_v5_asset_path(str(img.get("assetPath") or ""))
+    if not asset_path:
+        print(
+            f"[v5] image route chose {image_id!r} but its asset "
+            f"{img.get('assetPath')!r} was not found on disk; skipping figure.",
+            file=sys.stderr,
+        )
+        return images, explanation_images, figure_refs
+    try:
+        data_url = _v5_data_url(asset_path, img.get("mimeType"))
+    except OSError as exc:
+        print(f"[v5] failed to read image asset {asset_path}: {exc}", file=sys.stderr)
+        return images, explanation_images, figure_refs
+    entry = {
+        "figureKey": None,
+        "dataUrl": data_url,
+        "isLabTable": False,
+        "kind": img.get("kind") or "figure",
+        "slideImageId": image_id,
+        "placement": placement,
+        "source": "v5-source-image",
+    }
+    figure_refs.append({"id": image_id, "location": placement, "visibleText": []})
+    if placement == "stem":
+        images.append(entry)
+    else:
+        explanation_images.append(entry)
+    return images, explanation_images, figure_refs
+
+
+# ── Stage 8c: external image sourcing (Phase 2) ─────────────────────────────
+
+
+class ExternalImageBudget:
+    """Thread-safe counter for borrowed external images in one deck.
+
+    Default is UNLIMITED (``cap=None``): whether a question gets an image is
+    Gemini's per-question decision (``stage_external_image_query``), NOT a
+    deck-level quota. An optional numeric cap is honored only if explicitly
+    set. ``reserve()`` claims a slot before a fetch; ``refund()`` returns it
+    if the fetch found nothing, so ``used`` reflects images actually
+    attached, not attempts."""
+
+    def __init__(self, cap: int | None) -> None:
+        self._cap = None if cap is None else max(0, int(cap))
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def reserve(self) -> bool:
+        with self._lock:
+            if self._cap is None or self._used < self._cap:
+                self._used += 1
+                return True
+            return False
+
+    def refund(self) -> None:
+        with self._lock:
+            if self._used > 0:
+                self._used -= 1
+
+    @property
+    def used(self) -> int:
+        with self._lock:
+            return self._used
+
+    @property
+    def cap(self) -> int | None:
+        return self._cap
+
+
+# Modality / "image is referenced" detector. Used to decide stem vs explanation
+# placement IN CODE — the external-query model defaulted to "explanation" for
+# 100% of questions, which buried the figure even when the stem text explicitly
+# refers to it ("an abdominal radiograph shows ..."). If the stem or its
+# discriminating clue names an image, the figure MUST sit in the STEM (otherwise
+# the reader is told to interpret a film they can't see until after answering —
+# a broken question). When neither references an image, the figure is a teaching
+# illustration and belongs in the EXPLANATION. This yields images in BOTH places
+# without trusting the model.
+_IMAGE_REFERENCE_RE = re.compile(
+    r"radiograph|x-?ray|\bfilm\b|\bkub\b|computed tomograph|\bct\b|\bct scan\b|"
+    r"\bmri\b|magnetic reson|ultrasound|ultrasonograph|sonogra|\bdoppler\b|"
+    r"echocardiogra|\becho\b|\becg\b|\bekg\b|electrocardiogra|rhythm strip|"
+    r"\bsmear\b|blood film|biopsy|histolog|microscop|\bstain\b|"
+    r"\bfundus\b|fundoscop|ophthalmoscop|\bretina|dermoscop|"
+    r"gross specimen|\bspecimen\b|autopsy|angiogram|angiography|"
+    r"\bscan\b|\bimaging\b|\bshown below\b|\bas shown\b|\bpictured\b|\bphotograph\b",
+    re.IGNORECASE,
+)
+
+
+def stem_references_image(stem: str, discriminating_clue: str) -> bool:
+    """True if the stem or its discriminating clue names/depicts an image, in
+    which case the borrowed figure must be placed in the stem (not explanation)."""
+    blob = f"{discriminating_clue or ''}\n{stem or ''}"
+    return bool(_IMAGE_REFERENCE_RE.search(blob))
+
+
+def stage_external_image_query(
+    *,
+    stem: str,
+    image_opportunity: str,
+    correct_answer_concept: str,
+    discriminating_clue: str,
+) -> dict[str, Any]:
+    """Ask the model whether a borrowed external image is warranted and, if so,
+    for a TEXT search query (never a URL). Short-circuits with no model call
+    when the kernel saw no image opportunity."""
+    if (image_opportunity or "none").strip().lower() == "none":
+        return {"want": False, "query": "", "modality": "none",
+                "placement": "stem", "reason": "no image opportunity"}
+    prompt = EXTERNAL_IMAGE_PROMPT_PATH.read_text(encoding="utf-8")
+    prompt = (
+        prompt
+        .replace("{{STEM}}", stem or "")
+        .replace("{{IMAGE_OPPORTUNITY}}", image_opportunity or "none")
+        .replace("{{CORRECT_CONCEPT}}", correct_answer_concept or "")
+        .replace("{{DISCRIMINATING_CLUE}}", discriminating_clue or "")
+    )
+    raw = gemini_call(prompt, model=IMAGE_MODEL, max_tokens=512,
+                      thinking_budget=0, temperature=0.2)
+    parsed = parse_json_loose(raw)
+    if not parsed or not parsed.get("want"):
+        return {"want": False, "query": "", "modality": "none",
+                "placement": "stem", "reason": (parsed or {}).get("reason", "")}
+    placement = str(parsed.get("placement") or "stem").strip().lower()
+    if placement not in ("stem", "explanation"):
+        placement = "stem"
+    return {
+        "want": True,
+        "query": str(parsed.get("query") or "").strip(),
+        "modality": str(parsed.get("modality") or image_opportunity or "").strip(),
+        "placement": placement,
+        "reason": parsed.get("reason", ""),
+    }
+
+
+def build_v5_external_media(
+    external_media: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Turn a fetched external image (from external_image_source) into the same
+    renderable image-entry shape Phase 1 uses, carrying license/attribution
+    metadata so a later UI pass can credit the source."""
+    images: list[dict[str, Any]] = []
+    explanation_images: list[dict[str, Any]] = []
+    figure_refs: list[dict[str, Any]] = []
+    if not external_media or not external_media.get("dataUrl"):
+        return images, explanation_images, figure_refs
+    placement = str(external_media.get("placement") or "stem").strip().lower()
+    if placement not in ("stem", "explanation"):
+        placement = "stem"
+    fid = "ext_" + hashlib.sha1(
+        (external_media.get("sourceUrl") or external_media.get("dataUrl", "")[:64])
+        .encode("utf-8")
+    ).hexdigest()[:10]
+    entry = {
+        "figureKey": None,
+        "dataUrl": external_media["dataUrl"],
+        "isLabTable": False,
+        "kind": external_media.get("modality") or "figure",
+        "placement": placement,
+        "source": "v5-external-image",
+        "external": True,
+        "sourceName": external_media.get("sourceName") or "",
+        "sourceUrl": external_media.get("pageUrl") or external_media.get("sourceUrl") or "",
+        "license": external_media.get("license") or "",
+        "attribution": external_media.get("attribution") or "",
+        "title": external_media.get("title") or "",
+    }
+    figure_refs.append({"id": fid, "location": placement, "visibleText": [], "external": True})
+    if placement == "stem":
+        images.append(entry)
+    else:
+        explanation_images.append(entry)
+    return images, explanation_images, figure_refs
+
+
 # ── Stage 9: ASSEMBLE ───────────────────────────────────────────────────────
 
 
@@ -556,8 +808,10 @@ def assemble_question(
     critic_obj: dict[str, Any] | None,
     image_route: dict[str, Any] | None,
     allocation: dict[str, Any],
+    external_media: dict[str, Any] | None = None,
     target_order: str,
     target_difficulty: str,
+    target_task: str = "",
     length_parity_info: dict[str, Any],
     rng: random.Random,
 ) -> dict[str, Any]:
@@ -591,6 +845,14 @@ def assemble_question(
     kernel_edu = (kernel.get("educationalObjective") or "").strip()
     kernel_tag = (kernel.get("retrievalTag") or "").strip()
     kernel_pearl = (kernel.get("reviewPearl") or "").strip()
+    media_images, media_explanation_images, media_figure_refs = build_v5_source_media(
+        image_route, allocation
+    )
+    if not (media_images or media_explanation_images):
+        ext_images, ext_explanation_images, ext_refs = build_v5_external_media(external_media)
+        media_images += ext_images
+        media_explanation_images += ext_explanation_images
+        media_figure_refs += ext_refs
     return {
         "questionNumber": question_number,
         "slideId": allocation.get("slideId", ""),
@@ -598,8 +860,10 @@ def assemble_question(
         "testedConcept": kernel_concept,
         "diagnosisOrTarget": kernel_concept,
         "stem": stem,
-        "hasEmbeddedFigure": bool(image_route and image_route.get("attach")),
-        "figureRefs": [],
+        "hasEmbeddedFigure": bool(media_images or media_explanation_images),
+        "figureRefs": media_figure_refs,
+        "images": media_images,
+        "explanationImages": media_explanation_images,
         "answerChoices": answer_choices,
         "correctAnswer": correct_label,
         "educationalObjective": kernel_edu or kernel_concept,
@@ -615,6 +879,7 @@ def assemble_question(
         "_v5_2": {
             "targetOrder": target_order,
             "targetDifficulty": target_difficulty,
+            "targetTask": target_task,
             "orderAchieved": stem_obj.get("orderAchieved", ""),
             "difficultyAchieved": stem_obj.get("difficultyAchieved", ""),
             "criticOverallTotal": (critic_obj or {}).get("overallTotal"),
@@ -703,9 +968,11 @@ def generate_one_question(
     allocation: dict[str, Any],
     target_order: str,
     target_difficulty: str,
+    target_task: str,
     memory: dict[str, Any],
     available_images: list[dict[str, Any]],
     rng: random.Random,
+    external_budget: "ExternalImageBudget | None" = None,
 ) -> dict[str, Any] | None:
     allowed_terms = allocation.get("allowedMedicalTerms") or []
     allowed_distractor_pool = allocation.get("allowedDistractorPool") or []
@@ -715,6 +982,7 @@ def generate_one_question(
     kernel = stage_kernel(
         target_order=target_order,
         target_difficulty=target_difficulty,
+        target_task=target_task,
         allowed_terms=allowed_terms,
         allowed_distractor_pool=allowed_distractor_pool,
         slide_context=slide_context,
@@ -728,6 +996,7 @@ def generate_one_question(
         kernel=kernel,
         target_order=target_order,
         target_difficulty=target_difficulty,
+        target_task=target_task,
         allowed_terms=allowed_terms,
         slide_context=slide_context,
     )
@@ -833,6 +1102,90 @@ def generate_one_question(
         available_images=available_images,
     )
 
+    # Per-question image-decision trace (surfaces in the app's pipeline log) so
+    # a run is self-documenting: which task this slot got, what modality the
+    # kernel flagged, and whether a SOURCE figure was attached (a source figure
+    # pre-empts any external borrow). Lets us diagnose "why no images" from the
+    # log alone, without a rebuild.
+    img_opp = (kernel.get("imageOpportunity") or "none").strip().lower()
+    _src_attached = bool((image_route or {}).get("attach"))
+    print(
+        f"[v5-img] Q{question_number} task={target_task} order={target_order} "
+        f"imageOpportunity={img_opp} sourceImageAttached={_src_attached} "
+        f"externalSourcing={'on' if external_budget is not None else 'off'}",
+        file=sys.stderr,
+    )
+
+    # Stage 8b: EXTERNAL IMAGE SOURCING (Phase 2)
+    # Only when the source had no suitable figure (source routing declined) and
+    # the kernel flagged a real image opportunity. Whether to borrow — and stem
+    # vs explanation — is Gemini's per-question call (stage_external_image_query);
+    # there is no deck-level quota unless V5_MAX_EXTERNAL_IMAGES forces one.
+    # Borrows ONE license-clean image from an open-access library. Applies to ALL
+    # Advanced Mode sources (incl. uWorld / Anki / Divine / OME) — this is the
+    # generated QUESTION's image, never the source ingestion path. Degrades
+    # silently to no image on any failure.
+    external_media = None
+    if external_budget is not None and not _src_attached and img_opp != "none":
+        try:
+            eq = stage_external_image_query(
+                stem=stem_obj["stem"],
+                image_opportunity=img_opp,
+                correct_answer_concept=kernel.get("correctAnswerConcept", ""),
+                discriminating_clue=kernel.get("discriminatingClueInStem", ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[v5-ext] Q{question_number} query stage failed: {exc}", file=sys.stderr)
+            eq = {"want": False}
+        if not (eq.get("want") and eq.get("query")):
+            print(
+                f"[v5-ext] Q{question_number} no external borrow "
+                f"(model want={bool(eq.get('want'))}, opp={img_opp})",
+                file=sys.stderr,
+            )
+        elif not external_budget.reserve():
+            print(
+                f"[v5-ext] Q{question_number} external budget exhausted — skipping borrow",
+                file=sys.stderr,
+            )
+        else:
+            ext = None
+            try:
+                import external_image_source as _eis
+                ext = _eis.fetch_external_image(
+                    eq["query"],
+                    eq.get("modality") or img_opp,
+                    cache_dir=EXTERNAL_IMAGE_CACHE_DIR,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[v5-ext] Q{question_number} fetch failed: {exc}", file=sys.stderr)
+            if ext:
+                # Placement is decided in CODE, not by the model: if the stem
+                # or its discriminating clue references an image, the figure
+                # MUST go in the stem (else the stem cites an invisible film);
+                # otherwise it's a teaching illustration → explanation. (The
+                # model's own placement is honored only as a tiebreak toward
+                # stem, never to override a stem reference.)
+                _stem_ref = stem_references_image(
+                    stem_obj["stem"], kernel.get("discriminatingClueInStem", "")
+                )
+                _placement = "stem" if (_stem_ref or eq.get("placement") == "stem") else "explanation"
+                external_media = {**ext, "placement": _placement}
+                print(
+                    f"[v5-ext] Q{question_number} attached external image "
+                    f"from {ext.get('sourceName')} (q={eq['query']!r}, "
+                    f"license={ext.get('license')!r}, placement={_placement}, "
+                    f"stemRefsImage={_stem_ref}, modelSaid={eq.get('placement')!r})",
+                    file=sys.stderr,
+                )
+            else:
+                external_budget.refund()
+                print(
+                    f"[v5-ext] Q{question_number} fetch returned no image "
+                    f"(q={eq['query']!r}) — degraded to no image",
+                    file=sys.stderr,
+                )
+
     # Stage 9: ASSEMBLE
     q = assemble_question(
         question_number=question_number,
@@ -844,8 +1197,10 @@ def generate_one_question(
         critic_obj=critic,
         image_route=image_route,
         allocation=allocation,
+        external_media=external_media,
         target_order=target_order,
         target_difficulty=target_difficulty,
+        target_task=target_task,
         length_parity_info=parity_info,
         rng=rng,
     )
@@ -880,9 +1235,12 @@ def generate_v5(
     memory: dict[str, Any],
     target_order_mix: dict[str, float] | None = None,
     target_difficulty_mix: dict[str, float] | None = None,
+    target_task_mix: dict[str, float] | None = None,
     available_images: list[dict[str, Any]] | None = None,
     seed: int = 0,
     max_workers: int | None = None,
+    external_images: bool | None = None,
+    max_external_images: int | None = None,
 ) -> list[dict[str, Any]]:
     target_order_mix = target_order_mix or {
         "first_order": 0.25,
@@ -894,29 +1252,70 @@ def generate_v5(
         "medium": 0.45,
         "difficult": 0.25,
     }
+    # Question TASK mix (what the question ASKS), independent of reasoning depth
+    # (order) above. Demotes "next step in management" from the old ~75% (it was
+    # baked into 2nd+3rd order) to 20%, spreading the rest across diagnosis,
+    # diagnostic workup, mechanism, etiology, associated findings, and
+    # complications. Keys must match the TASK DEFINITIONS in the kernel prompt.
+    target_task_mix = target_task_mix or {
+        "diagnosis":        0.22,
+        "next_dx_step":     0.16,
+        "next_mgmt_step":   0.20,
+        "mechanism":        0.16,
+        "causative_agent":  0.10,
+        "expected_finding": 0.10,
+        "complication":     0.06,
+    }
+    # Phase 2: external borrowed-image sourcing. ON by default for Advanced
+    # Mode (the user explicitly asked to bake it in); roll back with
+    # V5_EXTERNAL_IMAGES=0. NO deck-level cap by default — whether a question
+    # gets an image is Gemini's per-question want+placement decision, not a
+    # quota. An optional ceiling can still be forced with V5_MAX_EXTERNAL_IMAGES=N.
+    if external_images is None:
+        external_images = (
+            os.environ.get("V5_EXTERNAL_IMAGES", "1").strip().lower()
+            not in ("0", "false", "no", "off", "")
+        )
     # v5.4 Lever 1: build the full per-slot task list first (the question
     # number, allocation, target order/difficulty, per-Q deterministic seed)
     # then dispatch to a ThreadPoolExecutor for concurrent generation. Each
     # task is independent — kernel/stem/distractors/critic/regen/image-route
     # all run within generate_one_question() — so a thread can own one Q
     # end-to-end without coordination with peers.
+    # v5.5 — TASK VARIETY FIX: plan all three dimensions GLOBALLY across the
+    # whole deck, then deal the planned slots out to chunks in order. The old
+    # code called plan_allocation_slots PER CHUNK with that chunk's (small)
+    # count, so largest-remainder rounding ran inside each allocation: any task
+    # whose weight * chunkSize was below the rounding cutoff got ZERO slots
+    # every time. With ~3-question chunks that erased all four low-weight tasks
+    # (mechanism / causative_agent / expected_finding / complication) and left
+    # every deck a diagnosis + next_dx + next_mgmt monoculture. Planning once
+    # over the deck total lets those tasks claim their slots (e.g. 21 Qs →
+    # ~3 mechanism, 2 causative, 2 finding, 1 complication).
+    chunk_counts = [max(0, int(a.get("questionCount") or 0)) for a in allocations]
+    total_slots = sum(chunk_counts)
+    global_plan = plan_allocation_slots(
+        total_slots, target_order_mix, target_difficulty_mix, target_task_mix,
+        seed=seed,
+    )
     tasks: list[dict[str, Any]] = []
     qn = 0
+    cursor = 0
     for alloc_idx, allocation in enumerate(allocations):
-        count = int(allocation.get("questionCount") or 0)
+        count = chunk_counts[alloc_idx]
         if count <= 0:
             continue
-        slot_plan = plan_allocation_slots(
-            count, target_order_mix, target_difficulty_mix, seed=seed + alloc_idx
-        )
+        slot_plan = global_plan[cursor:cursor + count]
+        cursor += count
         slide_images = allocation.get("slideImages") or available_images or []
-        for (target_order, target_difficulty) in slot_plan:
+        for (target_order, target_difficulty, target_task) in slot_plan:
             qn += 1
             tasks.append({
                 "qn":                  qn,
                 "allocation":          allocation,
                 "target_order":        target_order,
                 "target_difficulty":   target_difficulty,
+                "target_task":         target_task,
                 "slide_images":        slide_images,
                 # Each Q gets a deterministic per-slot RNG so the position
                 # shuffle in stage_assemble is reproducible regardless of
@@ -924,6 +1323,21 @@ def generate_v5(
                 # enough to push consecutive Qs into separate RNG streams.
                 "rng":                 random.Random(seed + qn * 7919),
             })
+
+    # Build the shared external-image budget. Default is UNLIMITED: Gemini's
+    # per-question want+placement decision is the only gate. A hard ceiling is
+    # applied ONLY if V5_MAX_EXTERNAL_IMAGES=N (or max_external_images) is set.
+    external_budget = None
+    if external_images:
+        if max_external_images is None:
+            env_cap = os.environ.get("V5_MAX_EXTERNAL_IMAGES", "").strip()
+            max_external_images = int(env_cap) if env_cap.isdigit() else None
+        external_budget = ExternalImageBudget(max_external_images)
+    if external_budget:
+        cap_label = "uncapped" if external_budget.cap is None else f"cap {external_budget.cap}"
+        print(f"[v5-ext] external images ON ({cap_label})", file=sys.stderr)
+    else:
+        print("[v5-ext] external images OFF", file=sys.stderr)
 
     # Memory is a shared mutable dict. With parallel question generation,
     # all Qs in a batch see the SAME initial memory (since they all start
@@ -939,9 +1353,11 @@ def generate_v5(
                 allocation=task["allocation"],
                 target_order=task["target_order"],
                 target_difficulty=task["target_difficulty"],
+                target_task=task["target_task"],
                 memory=memory,
                 available_images=task["slide_images"],
                 rng=task["rng"],
+                external_budget=external_budget,
             )
         except Exception as exc:
             print(f"[v5.4] Q{task['qn']} pipeline error: {exc}", file=sys.stderr)
