@@ -1,13 +1,18 @@
 # BATCH 5 — Organic generator quality overhaul (v5)
 
 Branch: `phase12-vertex-migration`
-Tag: `v5.10-batch5-stable` (latest). This stable tag bundles
-everything from v5.7 through v5.10: Advanced Mode for all organic
-sources (v5.7 Fast Facts/Emma, v5.8 UWorld/Mehlman/Anki/Divine), the
-image-in-stem + global task-variety fixes (v5.9), and the new opt-in
-**Refined** quality tier (v5.10). It supersedes the earlier
-`v5.7/v5.8/v5.9-batch5-pending-validation` tags — their changes are
-all included here. The user approved promotion to `-stable`.
+Tag: `v5.12-batch5-stable` (latest). The earlier `v5.10-batch5-stable`
+bundled v5.7 through v5.10: Advanced Mode for all organic sources
+(v5.7 Fast Facts/Emma, v5.8 UWorld/Mehlman/Anki/Divine), the
+image-in-stem + global task-variety fixes (v5.9), and the opt-in
+**Refined** quality tier (v5.10) — superseding the earlier
+`v5.7/v5.8/v5.9-batch5-pending-validation` tags. **v5.12** now adds, on
+top of that: the Mehlman image relevance gate (default-on), the Fast
+Facts + uworld-family reviewPearl/retrievalTag backfill, the Fast Facts
+durable per-chunk resume cache (Track B), the BIC live progress bar
+across every generator (v5.11), and the persistent pause/resume UX
+(Track A). Full per-change detail is in `GIT_TAG_HISTORY.md`. The user
+approved promotion to `-stable`.
 
 ## Scope (very important): organic-generation only
 
@@ -55,6 +60,7 @@ shipped in `v4.85-batch4-stable`.
 | `v5.8-batch5-pending-validation` | **Advanced Mode for all of Group B (UWorld notes + Mehlman PDF + Anki notes + Divine podcasts).** OME's v5.3 adapter promoted to shared `tools/shared-ingestion/v5_uworld_family_adapter.py` with a `process_file_v5_uworld_family()` helper. Each Group B generator + profile runner now accepts `--v5` flags. Registry: supportsAdvancedMode + advancedArgs for all 4 sources; supportsChunkControls for UWorld/Anki/Divine (Mehlman hides chunk knobs because its legacy CLI already owns `--questions-per-chunk`). Code shipped; same deferral as v5.7. |
 | `v5.9-batch5-pending-validation` | **Two user-caught bugs on the organic Advanced Mode pipeline, both fixed in CODE (not prompt nudges).** (1) **Image-in-stem:** borrowed external images appeared ONLY in answer explanations, never in stems — even when the stem's discriminating clue literally cited the image ("an abdominal radiograph shows…"), producing questions referencing an invisible film. Root cause: Stage 8b set `placement` from the model's choice, which was "explanation" 100% of the time. Fix: placement now decided in code via `stem_references_image()` (regex over the stem + discriminating clue) → STEM when the vignette cites an image, EXPLANATION otherwise. (2) **Task variety:** every question was "next step in management/diagnosis"; the four low-weight tasks (mechanism, causative_agent, expected_finding, complication) never appeared. Root cause: `plan_allocation_slots` ran PER CHUNK with a small n (~3), so largest-remainder rounding funded only the top-3 weighted tasks and zeroed the other four in every chunk. Fix: plan all three dimensions GLOBALLY across the whole deck, then deal slots to chunks by cursor. Partner prompt edits separate ORDER (reasoning depth) from TASK (what is asked) and thread `{{TARGET_TASK}}` into the kernel + stem prompts so the correct answer + final question match the assigned task. Also: `.q-img-credit` attribution line under borrowed images (CC BY/BY-SA), `external_image_source.py` query-ladder + retry, and `targetTask` recorded in v5 debug artifacts. Single shared `v5_pipeline.py` — all organic generators (OME, UWorld, Mehlman, Anki, Divine, lecture-slide) inherit both fixes; NBME/AMBOSS verbatim untouched. **User verified both fixes on a rebuilt `.app` (live OME run): "everything looks good."** |
 | `v5.10-batch5-stable` | **Opt-in "Refined" quality tier alongside Advanced (still the default).** A single `Refined mode` toggle inside the Advanced Mode panel engages a cheaper/faster pass that keeps image embedding (Stage 8/8b + stem-placement rule), the task/difficulty/answer-choice distributions, the kernel-first trap design, and length parity **identical to Advanced**. It trims reasoning where the marginal quality return is lowest: kernel thinking capped at 4096 (vs uncapped `-1`), stems written on `gemini-2.5-flash`@1536 (vs Pro), and the Pro adversarial critic run **only** on `third_order` OR `difficult` questions (everything else skips critic + its regen). Projected ~50% cost + wall-time cut. Implemented as a `V5_REFINED=1` env master switch set by `run_pipeline_job.py` (from `advancedConfig.refined`) and inherited through the whole subprocess spawn chain; `generate_v5(mode=…)` defaults via `_default_mode()`, so **all 7 organic generators** (OME, Fast Facts, Emma, UWorld, Mehlman, Anki, Divine) pick it up with zero per-runner flag plumbing. UI cost preview halves and shows the tier. NBME/AMBOSS verbatim untouched. |
+| `v5.11`/`v5.12-batch5-stable` | **Reliability + UX rollup (full detail in `GIT_TAG_HISTORY.md`).** (1) **Mehlman image relevance gate, default-on:** every borrowed/extracted figure is vision-checked against its own question and dropped if unrelated — fixes q011's PDA O2-sat diagram landing on a tricuspid-regurgitation question; fail-safe drops on error; env kill-switch `MEHLMAN_IMAGE_RELEVANCE_GATE=0`. Proven on the user's real HY Pediatrics deck (KEEP 66 / DROP 91; mismatches removed, user verified "confirmed, gone"). (2) **reviewPearl/retrievalTag backfill** for Fast Facts + the whole uworld family — one omitted non-load-bearing field no longer fails the gate or collapses a chunk to placeholders (the FF-Peds 18-question loss); load-bearing keys still hard-fail. (3) **Fast Facts durable per-chunk resume cache** (`core/uoga/chunk_cache.py`): quit/retry reloads finished chunks instead of regenerating them; atomic, corrupt-tolerant, no-op without a durable job root. (4) **BIC live "P% · n/total · ~ETA" progress bar** for every generator (`v5_pipeline.py` emits `BIC_PROGRESS`; timestamp-tolerant Mehlman parser; widget-hide regression fixed). (5) **Persistent "⏸ PAUSED" badge** on both floating widgets with ETA suppression + rate-window restart on resume. Promoted to `-stable` on source + build + real-deck evidence at the user's explicit instruction; fresh live generation + in-app UI click-through deferred. |
 
 ## v5.3 — OME organic generator port
 

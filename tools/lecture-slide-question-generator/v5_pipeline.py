@@ -962,10 +962,7 @@ def _build_explanation_sections(
             d = distractor_label_map[label]
             text = (d.get("text") or "").strip()
             losing = (d.get("losingReason") or "").strip()
-            cat = (d.get("trapCategory") or "").strip()
             line = f"{label}. {text} — {losing}"
-            if cat:
-                line += f"  [trap: {cat.lower().replace('_', ' ')}]"
             lines.append(line)
         if lines:
             sections.append({"heading": "Incorrect Answer Explanation", "body": lines})
@@ -1304,6 +1301,34 @@ def generate_one_question(
     return q
 
 
+def _emit_bic_progress(**payload: Any) -> None:
+    """Emit one ``BIC_PROGRESS {json}`` line for the Batch Import Center's
+    floating status bar (live percentage + ETA).
+
+    This is the single backend hook that makes the BIC progress bar work for
+    EVERY organic v5 generator — OME (``--v5``) and the whole UWorld family
+    (Mehlman / UWorld / Anki / Divine) call ``generate_v5`` as one blocking
+    step and previously emitted no per-question telemetry, so the renderer
+    only ever saw the 60s "still running" heartbeat and the bar stayed empty.
+
+    No-op unless ``BIC_PROGRESS_SOURCE`` is set (electron/main.js sets it to the
+    job's sourceType for every BIC run), so a standalone smoke-test of this
+    module never prints these lines. The renderer's ``_flwExtractProgress``
+    consumes ``question`` / ``questionTotal`` to drive the %/ETA display.
+    Wrapped so progress reporting can never raise into the generation path.
+    """
+    source = str(os.environ.get("BIC_PROGRESS_SOURCE") or "").strip()
+    if not source:
+        return
+    try:
+        print(
+            "BIC_PROGRESS " + json.dumps({"source": source, **payload}, ensure_ascii=False),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def generate_v5(
     *,
     normalized_payload: dict[str, Any],
@@ -1465,12 +1490,24 @@ def generate_v5(
         return task["qn"], q
 
     effective_workers = max(1, int(max_workers if max_workers is not None else V5_MAX_WORKERS))
+    # Live progress for the BIC floating status bar. done_q is only ever
+    # touched from this (the calling) thread — the as_completed loop below runs
+    # in the main thread, not the workers — so no lock is needed.
+    total_q = len(tasks)
+    done_q = 0
     if effective_workers == 1 or len(tasks) <= 1:
         # Single-worker path keeps the v5.2-style sequential behavior so
         # an env-var rollback (V5_MAX_WORKERS=1) skips the executor entirely.
         results: dict[int, dict[str, Any] | None] = {}
         for task in tasks:
             results[task["qn"]] = _run_task(task)[1]
+            done_q += 1
+            _emit_bic_progress(
+                phase="generating",
+                message=f"Generated question {done_q} of {total_q}",
+                question=done_q,
+                questionTotal=total_q,
+            )
     else:
         print(
             f"[v5.4] generating {len(tasks)} question(s) across "
@@ -1484,6 +1521,13 @@ def generate_v5(
                 task = futures[future]
                 _, q = future.result()
                 results[task["qn"]] = q
+                done_q += 1
+                _emit_bic_progress(
+                    phase="generating",
+                    message=f"Generated question {done_q} of {total_q}",
+                    question=done_q,
+                    questionTotal=total_q,
+                )
 
     # Reassemble in original (question-number) order so the global gate
     # and downstream consumers see the same sequencing they would have

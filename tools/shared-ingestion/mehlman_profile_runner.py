@@ -107,10 +107,18 @@ def run_existing_mehlman_generator(
     # generic messages, which left the renderer with nothing better than
     # "shared ingestion still running after Xs" heartbeats. Now the floating
     # log shows things like "Generating questions from chunk 23/76 (page 12)".
-    _PAGE_TOTAL_RE = re.compile(r"^\s*(\d+)\s+pages\s+detected")
-    _CHUNK_TOTAL_RE = re.compile(r"^\s*(\d+)\s+chunk\(s\)\s+→")
-    _CHUNK_PROGRESS_RE = re.compile(r"^\s*Chunk\s+(\d+):\s+(\d+)\s+question\(s\)\s+generated")
-    _STAGE_RE = re.compile(r"^\s*Stage\s+(\d+):\s+(.+)$")
+    # v5.11: the downstream generator logs every line through uworld's log()
+    # helper, which prepends a "[HH:MM:SS] " timestamp. The original
+    # ^\s*-anchored patterns below therefore never matched (each line starts
+    # with "["), so the per-chunk progress events silently never fired and the
+    # BIC status bar got no counters for legacy (non-v5) Mehlman runs. Tolerate
+    # an optional leading "[...]" stamp. Backward-compatible: the optional group
+    # matches zero times when a line has no prefix.
+    _TS = r"^\s*(?:\[[^\]]*\]\s*)?"
+    _PAGE_TOTAL_RE = re.compile(_TS + r"(\d+)\s+pages\s+detected")
+    _CHUNK_TOTAL_RE = re.compile(_TS + r"(\d+)\s+chunk\(s\)\s+→")
+    _CHUNK_PROGRESS_RE = re.compile(_TS + r"Chunk\s+(\d+):\s+(\d+)\s+question\(s\)\s+generated")
+    _STAGE_RE = re.compile(_TS + r"Stage\s+(\d+):\s+(.+)$")
     _EXTRACTING_RE = re.compile(r"Extracting pages from (.+)$")
     _APP_READY_RE = re.compile(r"App-ready → (\S+)\s+\((\d+)\s+questions\)")
     total_chunks = 0

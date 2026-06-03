@@ -355,9 +355,69 @@ def stem_has_explicit_final_question(stem: str) -> bool:
 
 
 # ── Validation ─────────────────────────────────────────────────────────────────
+def _first_explanation_text(q: Dict) -> str:
+    """First non-empty explanation body text — a backfill source for the
+    non-load-bearing teaching fields below."""
+    for section in q.get("explanationSections") or []:
+        if not isinstance(section, dict):
+            continue
+        joined = " ".join(
+            b.strip()
+            for b in (section.get("body") or [])
+            if isinstance(b, str) and b.strip()
+        )
+        if joined:
+            return joined
+    return ""
+
+
+def backfill_nonessential_question_fields(q: Dict) -> Dict:
+    """Fill non-load-bearing teaching/metadata fields (reviewPearl,
+    retrievalTag) in place from existing content, so a bare omission is never
+    treated as a validation failure.
+
+    Why this exists
+    ---------------
+    Gemini intermittently omits these display-only fields. Before this, a
+    missing ``reviewPearl`` (or ``retrievalTag``) made ``validate_question``
+    return an error, which forced an extra repair Gemini call and — if the
+    model omitted it again — routed an otherwise-valid question to manual
+    review (or dropped it). That is the same root cause as the FF-Peds
+    lecture-slide failure (18 questions lost solely to a missing reviewPearl),
+    and this is the uworld-family counterpart of the fix in
+    generate_lecture_slide_questions._backfill_nonessential_question_keys.
+
+    Shared by every generator that runs through ``call_gemini_with_retry`` /
+    ``process_file`` (OME, Mehlman, Divine, Anki, UWorld). Load-bearing fields
+    (stem, answerChoices, correctAnswer, explanationSections) are deliberately
+    NOT touched here — they are still hard-validated below. A field that
+    already holds content is never overwritten.
+    """
+    if not isinstance(q, dict):
+        return q
+    objective = str(q.get("educationalObjective") or "").strip()
+    explanation = _first_explanation_text(q)
+    if not str(q.get("reviewPearl") or "").strip():
+        pearl = objective or explanation or str(q.get("retrievalTag") or "").strip()
+        if pearl:
+            q["reviewPearl"] = pearl
+    if not str(q.get("retrievalTag") or "").strip():
+        tag = objective or str(q.get("reviewPearl") or "").strip() or explanation
+        if tag:
+            q["retrievalTag"] = tag
+    return q
+
+
 def validate_question(q: Dict) -> List[str]:
     """Returns a list of error strings. Empty = valid."""
     errors: List[str] = []
+
+    # Backfill non-load-bearing teaching/metadata fields (reviewPearl,
+    # retrievalTag) BEFORE the required-field checks, so a bare omission never
+    # forces a wasted repair call or routes a usable question to review. The
+    # load-bearing checks below are unchanged; a question with no content to
+    # backfill from still fails (its empty explanationSections also fail).
+    backfill_nonessential_question_fields(q)
 
     if not q.get("questionNumber"):
         errors.append("missing questionNumber")

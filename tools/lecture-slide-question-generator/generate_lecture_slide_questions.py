@@ -63,6 +63,10 @@ def _load_uoga_module(name: str) -> Any:
 _execution_graph_module = _load_uoga_module("execution_graph")
 _finalization_module = _load_uoga_module("finalization")
 _retry_module = _load_uoga_module("retry" + "_engine")
+# v5.12 (Track B): durable per-chunk resume cache. Survives quit + retry because
+# BIC reuses the same jobId (so JOB_OUTPUT_ROOT persists). See core/uoga/chunk_cache.py.
+_chunk_cache_module = _load_uoga_module("chunk" + "_cache")
+ChunkResumeCache = _chunk_cache_module.ChunkResumeCache
 build_execution_graph = _execution_graph_module.build_execution_graph
 finalize_job_gate = _finalization_module.finalize_job_gate
 JobContext = _finalization_module.JobContext
@@ -1947,6 +1951,49 @@ def question_schema_required_keys() -> str:
     }, ensure_ascii=False)
 
 
+def _backfill_nonessential_question_keys(item: Any) -> Any:
+    """Fill safe defaults for non-load-bearing question keys, IN PLACE.
+
+    Organic generators (Gemini) intermittently omit a trailing metadata/teaching
+    field -- most often ``reviewPearl`` -- even when the question is otherwise
+    complete and clinically sound. Those fields are NOT load-bearing for
+    correctness, and the downstream normalizer already backfills them. Filling
+    them here, BEFORE the required-keys gate, stops a single omitted field from
+    discarding a good question -- and, when every question in a chunk omits the
+    same field, from collapsing the whole chunk into manual-review placeholders.
+
+    This was the FF-Peds failure mode: 6 chunks (18 questions) were dropped
+    solely because Gemini omitted ``reviewPearl``; every one was otherwise valid.
+    Only keys that are missing entirely (or explicitly null) are filled, so a
+    value the model DID provide is never altered. The genuinely essential keys
+    (slideId / stem / answerChoices / correctAnswer / correctExplanation /
+    incorrectExplanations) are intentionally NOT defaulted here -- their absence
+    still fails the gate, so a real generation failure is still rejected.
+    """
+    if not isinstance(item, dict):
+        return item
+    objective = str(item.get("educationalObjective") or "").strip()
+    correct_expl = str(item.get("correctExplanation") or "").strip()
+    tested = str(item.get("testedConcept") or item.get("diagnosisOrTarget") or "").strip()
+    defaults = {
+        "questionKind": "single-best-answer",
+        "stemTemplate": "",
+        "testedConcept": tested,
+        "diagnosisOrTarget": tested,
+        "distractorFamily": "",
+        "educationalObjective": objective or correct_expl,
+        "retrievalTag": tested,
+        "reviewPearl": correct_expl or objective,
+        "imageRouting": [],
+        "tableUse": [],
+        "sourceFactIds": [],
+    }
+    for key, value in defaults.items():
+        if key not in item or item.get(key) is None:
+            item[key] = value
+    return item
+
+
 def extract_generated_question_items(
     parsed: Any,
     allocations: list[dict[str, Any]],
@@ -1976,6 +2023,7 @@ def extract_generated_question_items(
     for idx, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             raise PipelineError(f"Generation {chunk_label} item {idx} is not an object.")
+        _backfill_nonessential_question_keys(item)
         missing = [key for key in required if key not in item]
         if missing:
             raise PipelineError(f"Generation {chunk_label} question {idx} missing required keys: {', '.join(missing)}")
@@ -2067,6 +2115,7 @@ def normalize_fast_facts_generated_question_items(
             item["slideId"] = allowed_slide_ids[0]
             warnings.append(f"item {idx} missing slideId; filled from one-item chunk")
         item["answerChoices"] = normalize_fast_facts_answer_choices(item.get("answerChoices") or item.get("choices"))
+        _backfill_nonessential_question_keys(item)
         missing = [key for key in FAST_FACTS_REQUIRED_QUESTION_KEYS if key not in item]
         if missing:
             malformed.append({"index": idx, "slideId": item.get("slideId"), "reason": "missing required keys: " + ", ".join(missing), "rawPayload": raw_item})
@@ -4348,6 +4397,28 @@ def fast_facts_review_stub_from_allocation(allocation: dict[str, Any], reason: s
     }
 
 
+# v5.12 (Track B): fingerprint for the durable per-chunk resume cache. Reuses
+# fast_facts_cache_key (which already encodes slide content hash + source-file
+# hash + prompt / validator / archetype-ontology versions + image-routing hash),
+# so ANY change that should regenerate questions also changes this fingerprint.
+# chunkIndex + per-slide allocation are folded in so a re-chunked or re-allocated
+# run never reuses a stale chunk. Returns "" (caching disabled for the chunk) if
+# the key can't be built, so a fingerprint hiccup degrades to today's behaviour.
+def _fast_facts_chunk_fingerprint(resume_cache: Any, normalized_payload: dict[str, Any], chunk: list[dict[str, Any]], chunk_index: int) -> str:
+    if resume_cache is None or not getattr(resume_cache, "enabled", False):
+        return ""
+    try:
+        slide_keys = [fast_facts_cache_key(normalized_payload, allocation["slide"]) for allocation in chunk]
+        return resume_cache.fingerprint({
+            "generator": "fast_facts_pptx",
+            "chunkIndex": int(chunk_index),
+            "slideKeys": slide_keys,
+            "alloc": [int(allocation.get("questionCount") or 0) for allocation in chunk],
+        })
+    except Exception:
+        return ""
+
+
 def generate_fast_facts_questions(normalized_payload: dict[str, Any], allocations: list[dict[str, Any]], memory: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -4398,13 +4469,53 @@ def generate_fast_facts_questions(normalized_payload: dict[str, Any], allocation
         executionGraph=graph.to_dict(),
         phase="planning",
     ))
+    # v5.12 (Track B): durable per-chunk resume cache, rooted at JOB_OUTPUT_ROOT
+    # so it survives quit + retry (same jobId). Disabled (no-op) on standalone
+    # runs where JOB_OUTPUT_ROOT is None.
+    resume_cache = ChunkResumeCache(JOB_OUTPUT_ROOT, "fast_facts_pptx")
+    resumed_chunks = 0
     for chunk_index, chunk in enumerate(chunks, start=1):
         chunk_label = f"fast_facts_chunk{chunk_index}"
         for allocation in chunk:
             allocation["chunkOrigin"] = {"chunkLabel": chunk_label, "chunkIndex": chunk_index, "chunkTotal": len(chunks)}
-        result = generate_fast_facts_chunk_with_retries(api_key, normalized_payload["sourceFile"], chunk, memory, chunk_label, chunk_index, len(chunks), graph)
+        # If this exact chunk was already generated in an earlier run of the SAME
+        # job, reuse those items and skip the Gemini call. We still mark the graph
+        # chunk "completed" (so finalize_job_gate finalizes) and emit a START event
+        # carrying chunk="N/M" (so the floating-UI counter advances), exactly as a
+        # fresh run would. Cached items are the RAW chunk output (pre-cleanup), the
+        # same boundary generate_fast_facts_chunk_with_retries returns, so the
+        # cleanup + memory-update loop below treats resumed and fresh items
+        # identically — no double cleanup, no memory drift.
+        chunk_fp = _fast_facts_chunk_fingerprint(resume_cache, normalized_payload, chunk, chunk_index)
+        cached_items = resume_cache.load(chunk_fp) if chunk_fp else None
+        if cached_items is not None:
+            items = cached_items
+            resumed_chunks += 1
+            if graph:
+                graph.mark_chunk_state(chunk_label, "completed", {"acceptedCount": len(items), "reviewRequiredCount": 0, "resumedFromCache": True})
+            resumed_event = fast_facts_chunk_event(
+                uoga_event("START"),
+                chunk=f"{chunk_index}/{len(chunks)}",
+                chunkLabel=chunk_label,
+                chunkIndex=chunk_index,
+                totalChunks=len(chunks),
+                allocatedQuestions=sum(int(a.get("questionCount") or 0) for a in chunk),
+                conceptCount=len(chunk),
+                resumedFromCache=True,
+                retryPhase="resumed",
+                executionGraph=graph.to_dict() if graph else None,
+            )
+            result = {"items": items, "events": [resumed_event], "dropped": [], "retried": False}
+            log(f"  Fast Facts {chunk_label}: resumed {len(items)} cached question(s) — skipped Gemini call")
+        else:
+            result = generate_fast_facts_chunk_with_retries(api_key, normalized_payload["sourceFile"], chunk, memory, chunk_label, chunk_index, len(chunks), graph)
+            items = result.get("items") or []
+            # Persist immediately so a quit right after this chunk doesn't lose it.
+            # Only non-empty (succeeded) chunks are cached, so dropped/failed chunks
+            # are always re-attempted on retry.
+            if items and chunk_fp:
+                resume_cache.save(chunk_fp, items, meta={"chunkLabel": chunk_label, "chunkIndex": chunk_index})
         telemetry["executionGraph"] = graph.to_dict()
-        items = result.get("items") or []
         telemetry["events"].extend(result.get("events") or [])
         telemetry["dropped"].extend(result.get("dropped") or [])
         if result.get("retried"):
@@ -4428,6 +4539,11 @@ def generate_fast_facts_questions(normalized_payload: dict[str, Any], allocation
         if complete_event:
             telemetry["events"].append(complete_event)
         telemetry["executionGraph"] = graph.to_dict()
+    # v5.12 (Track B): surface how many chunks were resumed from the durable
+    # cache (0 on a fresh run; >0 after a quit + retry of the same job).
+    telemetry["summary"]["resumedChunks"] = resumed_chunks
+    if resumed_chunks:
+        log(f"  Fast Facts resume: reused {resumed_chunks} of {len(chunks)} chunk(s) from durable cache (no Gemini call)")
     generated_path = GENERATED_DIR / f"{stem}_fast_facts_generated_questions.json"
     write_json(generated_path, {"questions": questions})
     mem_path = MEMORY_DIR / f"{stem}_fast_facts_rolling_memory.json"

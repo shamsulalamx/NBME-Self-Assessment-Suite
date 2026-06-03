@@ -1399,6 +1399,24 @@ body.quiz-fullscreen-mode #modal-lab  { z-index: 10002 !important; }
   display: none;
 }
 #floating-log-widget.has-events { display: flex; flex-direction: column; }
+/* v5.11: sticky live percentage + ETA bar — persists across heartbeats so the
+   user always sees "P% · n/total · ~ETA" instead of only "still running". */
+#flw-status {
+  display: none;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #7fd1ff;
+  background: #141926;
+  border-bottom: 1px solid #2d3548;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#flw-status.active { display: block; }
+/* v5.12 (Track A): paused state — amber, distinct from the blue "running" bar so
+   "⏸ PAUSED" is unmistakable confirmation that the job is frozen, not stuck. */
+#flw-status.paused { color: #ffce6b; background: #2a2410; border-bottom-color: #4a3d18; }
 .flw-header {
   display: flex;
   align-items: center;
@@ -2680,6 +2698,7 @@ body.quiz-fullscreen-mode #modal-lab  { z-index: 10002 !important; }
     <button class="flw-min" id="flw-min-btn" onclick="App.minimizeFloatingLog(event)" title="Minimize">−</button>
     <button class="flw-close" id="flw-close-btn" onclick="App.dismissFloatingLog(event)" title="Hide for this job">×</button>
   </div>
+  <div class="flw-status" id="flw-status"></div>
   <div class="flw-body" id="flw-body">
     <div class="flw-event"><span class="flw-event-text" style="opacity:0.6;">Waiting for events…</span></div>
   </div>
@@ -4698,18 +4717,50 @@ window.MiscDocStore = MiscDocStore;
     return (await resp.json()).id;
   }
 
+  // Human-readable ETA for Drive backup progress. Local to this IIFE — the
+  // App-scope _fmtEtaShort lives in a different closure and isn't reachable here.
+  function _fmtDriveEta(secs) {
+    if (!Number.isFinite(secs) || secs <= 0) return '';
+    if (secs < 60) return '<1m';
+    const m = Math.round(secs / 60);
+    if (m < 60) return '~' + m + 'm';
+    const h = Math.floor(m / 60), mm = m % 60;
+    return '~' + h + 'h' + (mm ? ' ' + mm + 'm' : '');
+  }
+
   async function uploadFiguresToDrive(snapshot) {
     const folderId = await ensureDriveFolder();
+    // Pre-count figures still needing upload so we can show % + ETA.
+    const pending = [];
     for (const test of snapshotTestsWithImages(snapshot)) {
       for (const q of test.questions || []) {
         for (const img of questionImageCollections(q).flat()) {
           if (!img.figureKey || img.driveFileId || !window.FigureStore) continue;
-          const dataUrl = await window.FigureStore.get(img.figureKey).catch(() => null);
-          const blob = dataUrl ? dataUrlToBlob(dataUrl) : null;
-          if (!blob) continue;
-          img.driveFileId = await uploadDriveFile(`${img.figureKey}.png`, blob, blob.type || 'image/png', folderId);
+          pending.push(img);
         }
       }
+    }
+    const total = pending.length;
+    if (total === 0) return;
+    const startTs = Date.now();
+    let done = 0;
+    for (const img of pending) {
+      const dataUrl = await window.FigureStore.get(img.figureKey).catch(() => null);
+      const blob = dataUrl ? dataUrlToBlob(dataUrl) : null;
+      if (blob) {
+        img.driveFileId = await uploadDriveFile(`${img.figureKey}.png`, blob, blob.type || 'image/png', folderId);
+      }
+      done++;
+      const pct = Math.round((done / total) * 100);
+      const elapsed = Date.now() - startTs;
+      const etaStr = elapsed > 0
+        ? _fmtDriveEta((Math.max(0, total - done) * (elapsed / done)) / 1000)
+        : '';
+      setDriveStatus(
+        'Backing up images… ' + pct + '% (' + done + '/' + total + ')'
+          + (etaStr ? ' · ' + etaStr + ' left' : ''),
+        '#f0a500'
+      );
     }
   }
 
@@ -4879,7 +4930,9 @@ window.MiscDocStore = MiscDocStore;
       applyDriveFileIdsToLocal(snapshot);
       _skipNextSchedule = true;
       DB.save();
+      setDriveStatus('Saving database manifest…', '#f0a500');
       await saveManifestToDrive(snapshot);
+      setDriveStatus('Saving documents…', '#f0a500');
       await saveMiscDocsToDrive();
       _driveDirty = false;
       _driveSyncInProgress = false;
@@ -8211,7 +8264,7 @@ const Quiz = (() => {
     } else {
       btn.classList.remove('submitted');
       btn.textContent = 'Submit';
-      if (hint) hint.textContent = r.chosen ? '' : 'Select an answer, then click Submit to lock it in.';
+      if (hint) hint.textContent = '';
     }
   }
 
@@ -24639,10 +24692,27 @@ const App = (() => {
           _label += ' · ' + _mins + 'm elapsed';
         }
       } catch (_e) { /* non-fatal: keep just the PDF name */ }
+      // v5.11: capture the base label (job name + elapsed) BEFORE appending the
+      // live %/ETA, so _updateFlwProgress can refresh ONLY the %/ETA portion in
+      // place (see there) without re-running this renderer's show/hide logic.
+      currentEl.setAttribute('data-jw-base', _label);
+      // BIC runs the queue serially, so the _flwProgress tracker (populated from
+      // the pipeline_progress counter stream) maps to this one running job.
+      // Fully guarded so a tracker hiccup can never break the widget.
+      try {
+        if (_flwPaused.paused) {
+          // v5.12 (Track A): frozen job — show the sticky badge, not stale %/ETA.
+          _label = '⏸ PAUSED · ' + _label;
+        } else if (running === 1) {
+          const _pe = _flwCompactLabel();
+          if (_pe) _label += ' · ' + _pe;
+        }
+      } catch (_e2) { /* non-fatal */ }
       currentEl.textContent = _label;
       currentEl.style.display = '';
     } else if (currentEl) {
       currentEl.textContent = '';
+      currentEl.removeAttribute('data-jw-base');
       currentEl.style.display = 'none';
     }
   }
@@ -24807,6 +24877,180 @@ const App = (() => {
     };
   }
 
+  // v5.11: live percentage + ETA tracker for the floating pipeline-log status
+  // bar — must work for EVERY import type. Different generators emit progress
+  // counters under different field names AND shapes, so a single hard-coded
+  // field set (the old bug) silently showed nothing for the ones that didn't
+  // match. Known conventions this normalizes:
+  //   • lecture-slide / generate_v5: chunk, chunkTotal, question, questionTotal
+  //     (plain numbers)
+  //   • UOGA Fast Facts (core/uoga/telemetry_engine): chunkIndex, totalChunks,
+  //     AND chunk as an "N/M" STRING (e.g. "1/58"); totalQuestions on PLAN
+  //   • verbatim extractors (NBME / AMBOSS / Mehlman): no structured fields,
+  //     just freeform text like "page 3 of 39" / "chunk 12 of 76", parsed by
+  //     _extractCountersFromMessage
+  // All of these collapse to one {unit, cur, total} so the sticky #flw-status
+  // bar shows "P% · n/total · ~ETA" no matter which pipeline is running.
+  let _flwProgress = null; // { jobId, unit, total, cur, firstTs, firstCur, lastTs, lastCur }
+  // v5.12 (Track A): persistent paused indicator, mirrored on BOTH the floating
+  // log status bar and the bottom-right jobs widget. Pause is SIGSTOP (main.js),
+  // which freezes the pipeline process immediately, so the badge stays up as
+  // unambiguous confirmation until the user resumes (or the job is cancelled /
+  // a new job starts). Set ONLY via _setBicPaused.
+  let _flwPaused = { paused: false, jobId: null };
+
+  function _flwExtractProgress(event) {
+    const fromMsg = _extractCountersFromMessage(String(event.message || ''));
+    // A counter may arrive as a plain number (most generators) OR as an "N/M"
+    // string (UOGA emits chunk="1/58"); pull cur + total out of either shape.
+    const pair = (v) => {
+      if (v === null || v === undefined) return { cur: 0, total: 0 };
+      if (typeof v === 'number') return { cur: Number.isFinite(v) ? v : 0, total: 0 };
+      const s = String(v);
+      let mm = s.match(/^\s*(\d+)\s*\/\s*(\d+)\s*$/);
+      if (mm) return { cur: Number(mm[1]), total: Number(mm[2]) };
+      mm = s.match(/(\d+)/);
+      return { cur: mm ? Number(mm[1]) : 0, total: 0 };
+    };
+    // First strictly-positive number across a list of candidate field aliases.
+    const firstPos = (...vals) => {
+      for (const v of vals) { const n = Number(v); if (Number.isFinite(n) && n > 0) return n; }
+      return 0;
+    };
+    const chunkP = pair(event.chunk);
+    const chunk = firstPos(chunkP.cur, event.chunkIndex, fromMsg.chunk);
+    const chunkTotal = firstPos(event.chunkTotal, event.totalChunks, chunkP.total, fromMsg.chunkTotal);
+    const questionP = pair(event.question);
+    const question = firstPos(questionP.cur, event.questionsCompleted, event.completedQuestions, fromMsg.question);
+    const questionTotal = firstPos(event.questionTotal, event.totalQuestions, questionP.total, fromMsg.questionTotal);
+    const pageP = pair(event.page);
+    const page = firstPos(pageP.cur, event.pageIndex, fromMsg.page);
+    const pageTotal = firstPos(event.pageTotal, event.totalPages, pageP.total, fromMsg.pageTotal);
+    // Prefer the finest-grained counter that has a real total: questions beat
+    // chunks beat pages. Clamp cur ≤ total so a late/over-count can't exceed
+    // 100%. Returning null (e.g. heartbeats) keeps the last status visible.
+    if (questionTotal > 0 && question > 0) return { unit: 'questions', cur: Math.min(question, questionTotal), total: questionTotal };
+    if (chunkTotal > 0 && chunk > 0) return { unit: 'chunks', cur: Math.min(chunk, chunkTotal), total: chunkTotal };
+    if (pageTotal > 0 && page > 0) return { unit: 'pages', cur: Math.min(page, pageTotal), total: pageTotal };
+    return null;
+  }
+
+  function _fmtEtaShort(secs) {
+    if (!Number.isFinite(secs) || secs <= 0) return '';
+    const m = Math.round(secs / 60);
+    if (m < 1) return '<1m';
+    if (m < 60) return '~' + m + 'm';
+    const h = Math.floor(m / 60), mm = m % 60;
+    return '~' + h + 'h' + (mm ? ' ' + mm + 'm' : '');
+  }
+
+  // v5.11: compact "73% · ~4m left" string derived from the live progress
+  // tracker, for the bottom-right jobs widget current-line (the floating-log
+  // status bar uses its own fuller rendering in _renderFlwStatus). Returns ''
+  // when there is no usable progress yet so callers can append unconditionally.
+  function _flwCompactLabel() {
+    const p = _flwProgress;
+    if (!p || !(p.total > 0) || !(p.cur > 0)) return '';
+    const pct = Math.max(0, Math.min(100, Math.round((p.cur / p.total) * 100)));
+    let etaStr = '';
+    if (p.lastCur > p.firstCur && p.lastTs > p.firstTs) {
+      const msPerUnit = (p.lastTs - p.firstTs) / (p.lastCur - p.firstCur);
+      etaStr = _fmtEtaShort((Math.max(0, p.total - p.lastCur) * msPerUnit) / 1000);
+    }
+    return pct + '%' + (etaStr ? ' · ' + etaStr + ' left' : '');
+  }
+
+  function _renderFlwStatus() {
+    const el = document.getElementById('flw-status');
+    if (!el) return;
+    const p = _flwProgress;
+    const hasProg = !!(p && p.total > 0 && p.cur > 0);
+    const paused = _flwPaused.paused;
+    // Nothing to show only when there's neither progress NOR a paused badge.
+    if (!hasProg && !paused) {
+      el.classList.remove('active', 'paused');
+      el.textContent = '';
+      return;
+    }
+    const parts = [];
+    // Paused takes precedence so the badge is the first thing the user reads.
+    if (paused) parts.push('⏸ PAUSED');
+    if (hasProg) {
+      const pct = Math.max(0, Math.min(100, Math.round((p.cur / p.total) * 100)));
+      parts.push('📊 ' + pct + '%');
+      parts.push(p.cur + '/' + p.total + ' ' + p.unit);
+      // ETA is meaningless while the process is frozen (wall-clock keeps moving
+      // but no units complete), so suppress it whenever paused.
+      if (!paused) {
+        let etaStr = '';
+        if (p.lastCur > p.firstCur && p.lastTs > p.firstTs) {
+          const msPerUnit = (p.lastTs - p.firstTs) / (p.lastCur - p.firstCur);
+          const etaSecs = (Math.max(0, p.total - p.lastCur) * msPerUnit) / 1000;
+          etaStr = _fmtEtaShort(etaSecs);
+        }
+        parts.push(etaStr ? etaStr + ' left' : 'estimating…');
+      }
+    }
+    el.textContent = parts.join(' · ');
+    el.classList.add('active');
+    el.classList.toggle('paused', paused);
+  }
+
+  function _updateFlwProgress(event) {
+    if (!event) return;
+    const prog = _flwExtractProgress(event);
+    if (!prog) return; // no counters on this event (e.g. heartbeat) — keep last status
+    const jobId = event.jobId ? String(event.jobId) : null;
+    const parsedTs = Date.parse(event.timestamp);
+    const ts = Number.isFinite(parsedTs) ? parsedTs : Date.now();
+    // New job, new stage, or new total → start a fresh rate window.
+    if (!_flwProgress || _flwProgress.jobId !== jobId
+        || _flwProgress.unit !== prog.unit || _flwProgress.total !== prog.total) {
+      _flwProgress = {
+        jobId: jobId, unit: prog.unit, total: prog.total, cur: prog.cur,
+        firstTs: ts, firstCur: prog.cur, lastTs: ts, lastCur: prog.cur,
+      };
+    } else if (prog.cur >= _flwProgress.cur) {
+      // Only advance on forward progress; ignore out-of-order late events.
+      _flwProgress.cur = prog.cur;
+      _flwProgress.lastTs = ts;
+      _flwProgress.lastCur = prog.cur;
+    }
+    _renderFlwStatus();
+    // v5.11.x REGRESSION FIX: refresh ONLY the bottom-right jobs-widget's live
+    // %/ETA, in place. The earlier version called the full
+    // renderJobsWidget(_batchImportState.queue) here — and when that queue was
+    // momentarily empty/stale during a run, renderJobsWidget's activeCount===0
+    // branch removed the 'has-jobs' class and HID the widget. Because progress
+    // events fire constantly, that hide kept winning and the widget vanished.
+    // This version never touches classes/visibility: it only rewrites the
+    // current line's text, and only while the widget is ALREADY shown.
+    // Widget show/hide stays owned solely by the real queue-data path.
+    try {
+      const widget = document.getElementById('jobs-widget');
+      const currentEl = document.getElementById('jw-current');
+      if (widget && currentEl && widget.classList.contains('has-jobs')) {
+        const base = currentEl.getAttribute('data-jw-base');
+        if (base) {
+          if (_flwPaused.paused) {
+            currentEl.textContent = '⏸ PAUSED · ' + base;
+          } else {
+            const pe = _flwCompactLabel();
+            currentEl.textContent = pe ? (base + ' · ' + pe) : base;
+          }
+        }
+      }
+    } catch (_e) { /* non-fatal */ }
+  }
+
+  function _resetFlwProgress() {
+    _flwProgress = null;
+    // v5.12 (Track A): a fresh job must never inherit a stale paused badge.
+    _flwPaused = { paused: false, jobId: null };
+    const el = document.getElementById('flw-status');
+    if (el) { el.classList.remove('active', 'paused'); el.textContent = ''; }
+  }
+
   function _appendFloatingLogEvent(event) {
     if (!event) return;
     const widget = document.getElementById('floating-log-widget');
@@ -24819,6 +25063,7 @@ const App = (() => {
       _floatingLogState.activeJobId = jobId;
       _floatingLogState.dismissedJobId = null;
       body.innerHTML = '';
+      _resetFlwProgress();
     }
     // Respect explicit dismissal for THIS job
     if (jobId && jobId === _floatingLogState.dismissedJobId) return;
@@ -24833,6 +25078,10 @@ const App = (() => {
     // append it to the DOM.
     const type = String(event.type || '');
     const summary = _floatingLogEventSummary(event);
+    // v5.11: update the sticky %/ETA status bar on every event (counter-bearing
+    // pipeline_progress events advance it; heartbeats are a no-op and keep the
+    // last known status visible instead of overwriting it with "still running").
+    _updateFlwProgress(event);
     // Track last non-heartbeat meaningful text for the smart-heartbeat fallback
     if (!summary.isHeartbeat && summary.text && summary.text !== 'progress') {
       _floatingLogState.lastMeaningfulText = (summary.text + (summary.detail ? ' (' + summary.detail + ')' : ''));
@@ -24879,6 +25128,7 @@ const App = (() => {
       setTimeout(function() {
         if (_floatingLogState.activeJobId === jobId) {
           widget.classList.remove('has-events');
+          _resetFlwProgress();
           const pill = document.getElementById('floating-log-pill');
           // v4.78: also hide the pill on job complete IF the user hadn't
           // explicitly minimized. If they minimized, leave the pill so they
@@ -26317,7 +26567,44 @@ Errors: ${escapeHTML(errors)}</div>
       if (pauseBtn) pauseBtn.disabled = false;
       return;
     }
+    _setBicPaused(jobId, false);  // v5.12: a cancelled job must not keep a stale "⏸ PAUSED" badge
     appendBatchImportProgress({ type: 'job_cancelled', timestamp: new Date().toISOString(), jobId, message: 'Cancel request sent.' });
+  }
+
+  // v5.12 (Track A): flip the persistent paused indicator on BOTH floating
+  // widgets (#flw-status bar + #jobs-widget current line). Pause is POSIX
+  // SIGSTOP in main.js — it freezes the pipeline process immediately, so the
+  // badge is the user's confirmation that work is truly halted (not stuck).
+  // On RESUME we also restart the ETA rate window from the current count, so
+  // the wall-clock spent paused isn't counted as "slow progress" and doesn't
+  // wildly inflate the estimate once the job picks back up.
+  function _setBicPaused(jobId, paused) {
+    _flwPaused = { paused: !!paused, jobId: jobId ? String(jobId) : null };
+    if (!paused && _flwProgress) {
+      const now = Date.now();
+      _flwProgress.firstTs = now;
+      _flwProgress.firstCur = _flwProgress.cur;
+      _flwProgress.lastTs = now;
+      _flwProgress.lastCur = _flwProgress.cur;
+    }
+    _renderFlwStatus();
+    // Mirror onto the bottom-right jobs widget WITHOUT touching its visibility
+    // (show/hide stays owned by the canonical queue path, per the v5.11 fix).
+    try {
+      const widget = document.getElementById('jobs-widget');
+      const currentEl = document.getElementById('jw-current');
+      if (widget && currentEl && widget.classList.contains('has-jobs')) {
+        const base = currentEl.getAttribute('data-jw-base');
+        if (base) {
+          if (_flwPaused.paused) {
+            currentEl.textContent = '⏸ PAUSED · ' + base;
+          } else {
+            const pe = _flwCompactLabel();
+            currentEl.textContent = pe ? (base + ' · ' + pe) : base;
+          }
+        }
+      }
+    } catch (_e) { /* non-fatal */ }
   }
 
   // v4.65: toggle SIGSTOP/SIGCONT on the active batch job via IPC. The button
@@ -26338,7 +26625,8 @@ Errors: ${escapeHTML(errors)}</div>
         if (result?.ok) {
           btn.textContent = '⏸ Pause';
           btn.dataset.paused = 'false';
-          appendBatchImportProgress({ type: 'job_resumed', timestamp: new Date().toISOString(), jobId, message: 'Job resumed.' });
+          _setBicPaused(jobId, false);  // v5.12: clear badge on both floating widgets
+          appendBatchImportProgress({ type: 'job_resumed', timestamp: new Date().toISOString(), jobId, message: '▶ Job resumed — the pipeline is continuing from exactly where it paused.' });
         } else {
           appendBatchImportProgress({ type: 'job_resume_failed', timestamp: new Date().toISOString(), jobId, message: result?.message || 'Resume request failed.' });
         }
@@ -26348,7 +26636,8 @@ Errors: ${escapeHTML(errors)}</div>
         if (result?.ok) {
           btn.textContent = '▶ Resume';
           btn.dataset.paused = 'true';
-          appendBatchImportProgress({ type: 'job_paused', timestamp: new Date().toISOString(), jobId, message: 'Job paused — any in-flight Gemini call will complete first, then the Python loop halts at the next instruction.' });
+          _setBicPaused(jobId, true);  // v5.12: show "⏸ PAUSED" on both floating widgets
+          appendBatchImportProgress({ type: 'job_paused', timestamp: new Date().toISOString(), jobId, message: '⏸ Job paused — the pipeline process is frozen immediately and stays exactly where it is. Click Resume to continue from the same point. (A long pause may interrupt an in-flight network request.)' });
         } else {
           appendBatchImportProgress({ type: 'job_pause_failed', timestamp: new Date().toISOString(), jobId, message: result?.message || 'Pause request failed.' });
         }

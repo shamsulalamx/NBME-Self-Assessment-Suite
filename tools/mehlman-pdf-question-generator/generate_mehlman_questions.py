@@ -449,25 +449,161 @@ def _data_url(path: Path) -> str:
     return f"data:{_mime_for(path)};base64,{encoded}"
 
 
+# ── Relevance gate (v4.59): vision check before attaching a page figure ───────
+# The page-proximity attachment below staples a page's figure to a question
+# purely because they share a PDF page. Mehlman pages pack several distinct
+# topics, so the lone figure may illustrate a DIFFERENT topic than the question
+# generated from that page (observed: a PDA O2-saturation diagram landing on a
+# tricuspid-regurgitation question — same page 7, different topic). This gate
+# actually LOOKS at the image with a multimodal call and keeps it ONLY when it
+# supports THIS question. Scope: Normal mode only — Advanced/v5 never calls the
+# stapler (it does its own description-matched image sourcing). Fail-safe: any
+# inability to obtain a clear "relevant" verdict drops the figure, because a
+# wrong image is worse for learning than no image.
+
+_IMAGE_GATE_ENV = "MEHLMAN_IMAGE_RELEVANCE_GATE"
+_image_gate_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _image_relevance_gate_enabled() -> bool:
+    """Gate is ON by default; set MEHLMAN_IMAGE_RELEVANCE_GATE=0 to disable."""
+    return (os.environ.get(_IMAGE_GATE_ENV, "1").strip() or "1").lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _figure_relevance_verdict(image_bytes: bytes, mime: str, question: Dict) -> Dict[str, Any]:
+    """Decide whether ``image_bytes`` belongs in ``question``'s explanation.
+
+    Returns {'keep': bool, 'depicts': str, 'reason': str, 'status': str} where
+    status is one of 'relevant' | 'irrelevant' | 'gate_error'. Fail-safe: every
+    non-affirmative outcome (call error, empty/garbled response, parse failure)
+    yields keep=False so an UNVERIFIED image is never attached. Verdicts are
+    cached by (image bytes, question signature) for determinism within a run.
+    """
+    stem = str(question.get("stem") or "").strip()
+    correct = str(question.get("correctAnswer") or "").strip()
+    correct_text = ""
+    for ch in (question.get("answerChoices") or []):
+        if isinstance(ch, dict) and str(ch.get("label") or "").strip() == correct:
+            correct_text = str(ch.get("text") or "").strip()
+            break
+    explanation = str(question.get("correctExplanation") or "").strip()
+    concept = str(
+        question.get("testedConcept")
+        or question.get("educationalObjective")
+        or question.get("retrievalTag")
+        or ""
+    ).strip()
+
+    sig = hashlib.md5(
+        (hashlib.md5(image_bytes).hexdigest() + "|" + stem[:160] + "|" + concept[:120]).encode("utf-8")
+    ).hexdigest()
+    if sig in _image_gate_cache:
+        return _image_gate_cache[sig]
+
+    prompt = (
+        "You are a medical-education quality reviewer. A figure was AUTOMATICALLY "
+        "extracted from the same PDF page as the source text for a board-style "
+        "question. Same-page is NOT proof the figure belongs to THIS question — "
+        "these source pages pack several unrelated topics onto one page.\n\n"
+        "Decide whether the attached figure should appear in THIS question's "
+        "answer explanation.\n\n"
+        f"QUESTION STEM:\n{stem}\n\n"
+        f"CORRECT ANSWER: {correct} — {correct_text}\n\n"
+        f"ANSWER EXPLANATION:\n{explanation}\n\n"
+        f"TESTED CONCEPT: {concept}\n\n"
+        "Look at the image. Keep it (relevant=true) ONLY if it directly "
+        "illustrates, depicts, or supports the specific concept this question "
+        "tests (the diagnosis, the mechanism, or an image the explanation refers "
+        "to). Reject (relevant=false) if it is about a DIFFERENT topic — even a "
+        "related one (a different cardiac lesion, a different organ, an unrelated "
+        "diagram). When unsure, reject.\n\n"
+        "Respond with STRICT JSON only, no markdown fences:\n"
+        '{"depicts": "<short phrase: what the image actually shows>", '
+        '"relevant": true, "reason": "<one sentence>"}'
+    )
+
+    def _cache(verdict: Dict[str, Any]) -> Dict[str, Any]:
+        _image_gate_cache[sig] = verdict
+        return verdict
+
+    try:
+        client = _uw._gemini_client()
+        t = _uw._genai_types
+        response = client.models.generate_content(
+            model=_uw.GEMINI_MODEL,
+            contents=[prompt, t.Part.from_bytes(data=image_bytes, mime_type=mime)],
+            config=t.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=2048,
+                response_mime_type="application/json",
+                # thinking_budget=0: this is a perception+matching task, not deep
+                # reasoning. Keeping it at 0 also avoids the 2.5-flash empty-text
+                # trap where thinking tokens consume the output budget.
+                thinking_config=t.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+    except Exception as exc:  # network, quota, SDK, auth — never raise into attach
+        return _cache({"keep": False, "depicts": "", "status": "gate_error",
+                       "reason": f"vision gate call failed: {exc}"[:200]})
+
+    raw = (getattr(response, "text", None) or "").strip()
+    if not raw:
+        return _cache({"keep": False, "depicts": "", "status": "gate_error",
+                       "reason": "empty vision response"})
+
+    parsed: Optional[Dict] = None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        mobj = re.search(r"\{.*\}", raw, re.DOTALL)
+        if mobj:
+            try:
+                parsed = json.loads(mobj.group(0))
+            except json.JSONDecodeError:
+                parsed = None
+    if not isinstance(parsed, dict) or "relevant" not in parsed:
+        return _cache({"keep": False, "depicts": "", "status": "gate_error",
+                       "reason": "vision verdict parse failed"})
+
+    keep = bool(parsed.get("relevant"))
+    return _cache({
+        "keep": keep,
+        "depicts": str(parsed.get("depicts") or "")[:160],
+        "reason": str(parsed.get("reason") or "")[:240],
+        "status": "relevant" if keep else "irrelevant",
+    })
+
+
 def _attach_chunk_figures_to_questions(
     questions: List[Dict],
     chunk: Dict,
     source_stem: str,
-) -> None:
-    """Attach all figures from the chunk's pages to the first question in-place.
+    *,
+    enable_gate: bool = False,
+) -> Dict[str, Any]:
+    """Attach the chunk's page figures to the first question in-place.
 
     Deterministic page-proximity: chunk knows pageStart-pageEnd; figures in
-    `chunk['figures']` were extracted from those pages. No Gemini multimodal
-    call required — pure file-system attachment.
+    `chunk['figures']` were extracted from those pages. When ``enable_gate`` is
+    set (Normal-mode live generation), each figure first passes a multimodal
+    relevance check against the target question — only figures that actually
+    illustrate the question are attached; topical mismatches are dropped. With
+    the gate off (dry-run), every figure attaches as before.
+
+    Returns {'attached': int, 'suppressed': int, 'suppressions': [...]}.
     """
+    summary: Dict[str, Any] = {"attached": 0, "suppressed": 0, "suppressions": []}
     figs = chunk.get("figures") or []
     if not figs or not questions:
-        return
+        return summary
 
     target = questions[0]
     target_q_num = int(target.get("questionNumber") or 0) or 1
     explanation_images = target.setdefault("explanationImages", [])
     figure_refs = target.setdefault("figureRefs", [])
+    gate_on = bool(enable_gate) and _image_relevance_gate_enabled()
 
     attach_warnings: List[str] = []
     for i, fig in enumerate(figs, start=1):
@@ -480,6 +616,35 @@ def _attach_chunk_figures_to_questions(
             f"mehlman_q{target_q_num:03d}_p{page_num:03d}_{i:02d}_{fig_name[-12:-4]}"
         )
         try:
+            image_bytes = fig_path.read_bytes()
+        except Exception as exc:
+            attach_warnings.append(
+                f"figure read failed (chunk {chunk.get('chunkId')}, {fig_name}): {exc}"
+            )
+            continue
+        mime = _mime_for(fig_path)
+
+        # Relevance gate (Normal mode): keep only figures that actually
+        # illustrate THIS question; drop topical mismatches. Fail-safe = drop.
+        if gate_on:
+            verdict = _figure_relevance_verdict(image_bytes, mime, target)
+            if not verdict.get("keep"):
+                summary["suppressed"] += 1
+                summary["suppressions"].append({
+                    "figure":   fig_name,
+                    "figureId": figure_id,
+                    "status":   verdict.get("status"),
+                    "depicts":  verdict.get("depicts"),
+                    "reason":   verdict.get("reason"),
+                })
+                attach_warnings.append(
+                    f"figure suppressed by relevance gate ({fig_name}; "
+                    f"{verdict.get('status')}): depicts '{verdict.get('depicts')}' "
+                    f"— {verdict.get('reason')}"
+                )
+                continue
+
+        try:
             # asset_path is informational only — the binary lives in dataUrl.
             # v4.58 fix: BIC runs with --output-dir write figures under the
             # job root, which is NOT under _BASE, so a naive relative_to
@@ -488,7 +653,7 @@ def _attach_chunk_figures_to_questions(
                 asset_path = str(fig_path.relative_to(_BASE))
             except ValueError:
                 asset_path = f"extracted_figures/{fig_name}"
-            data_url_str = _data_url(fig_path)
+            data_url_str = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         except Exception as exc:
             attach_warnings.append(
                 f"figure attach failed (chunk {chunk.get('chunkId')}, {fig_name}): {exc}"
@@ -514,11 +679,13 @@ def _attach_chunk_figures_to_questions(
             "location":    "explanation",
             "visibleText": [],
         })
+        summary["attached"] += 1
 
     if explanation_images:
         target["hasEmbeddedFigure"] = True
     if attach_warnings:
         target.setdefault("extractionWarnings", []).extend(attach_warnings)
+    return summary
 
 
 # ── Asset markers ─────────────────────────────────────────────────────────────
@@ -722,13 +889,25 @@ def process_pdf(
                     chunk_text, questions_per_chunk, chunk["chunkId"], gen_stats
                 )
                 qs = _uw.renumber_questions(qs, len(all_questions))
-                _attach_chunk_figures_to_questions(qs, chunk, stem)
+                fig_summary = _attach_chunk_figures_to_questions(
+                    qs, chunk, stem, enable_gate=True
+                )
                 all_questions.extend(qs)
                 stats["warnings"].extend(chunk_warns)
                 c_stat["status"]             = "ok"
                 c_stat["questionsGenerated"] = len(qs)
-                c_stat["figuresAttached"]    = len(chunk.get("figures") or [])
-                _uw.log(f"    Chunk {chunk['chunkId']}: {len(qs)} question(s) generated")
+                c_stat["figuresAttached"]    = fig_summary["attached"]
+                c_stat["figuresSuppressed"]  = fig_summary["suppressed"]
+                if fig_summary["suppressions"]:
+                    c_stat["figureSuppressions"] = fig_summary["suppressions"]
+                _gate_note = (
+                    f", {fig_summary['suppressed']} figure(s) gated out"
+                    if fig_summary["suppressed"] else ""
+                )
+                _uw.log(
+                    f"    Chunk {chunk['chunkId']}: {len(qs)} question(s) generated"
+                    f"{_gate_note}"
+                )
                 time.sleep(1)
             except json.JSONDecodeError as exc:
                 msg = f"chunk {chunk['chunkId']} JSON parse error: {exc}"
