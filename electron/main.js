@@ -815,12 +815,22 @@ function sanitizeBatchJobPayload(payload, source) {
     ? payload.advancedConfig
     : {};
   const supportsChunkControls = advancedMode && !!source?.supportsChunkControls;
-  const advancedConfig = supportsChunkControls
-    ? {
-        chunkSize: Math.max(0, Math.floor(Number(advancedConfigInput.chunkSize) || 0)),
-        questionsPerChunk: Math.max(0, Math.floor(Number(advancedConfigInput.questionsPerChunk) || 0)),
-      }
-    : {};
+  // v5.10: Refined is an opt-in quality tier WITHIN Advanced Mode. Unlike the
+  // chunk knobs it is NOT chunk-specific — it applies to every organic v5
+  // generator (OME, Fast Facts, Emma, uWorld family, …) — so it is gated only
+  // on advancedMode, never on supportsChunkControls. run_pipeline_job turns
+  // advancedConfig.refined into V5_REFINED=1 in the generator subprocess env,
+  // which v5_pipeline reads via _default_mode().
+  const refined = advancedMode && advancedConfigInput.refined === true;
+  const advancedConfig = {
+    ...(supportsChunkControls
+      ? {
+          chunkSize: Math.max(0, Math.floor(Number(advancedConfigInput.chunkSize) || 0)),
+          questionsPerChunk: Math.max(0, Math.floor(Number(advancedConfigInput.questionsPerChunk) || 0)),
+        }
+      : {}),
+    ...(refined ? { refined: true } : {}),
+  };
 
   if (!sourceType) throw new Error('sourceType is required.');
   if (!inputPaths.length) throw new Error('At least one input file is required.');

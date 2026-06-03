@@ -166,6 +166,53 @@ DISTRACTOR_THINKING_BUDGET = _env_thinking("V5_DISTRACTOR_THINKING_BUDGET", 2048
 CRITIC_THINKING_BUDGET = _env_thinking("V5_CRITIC_THINKING_BUDGET", 2048)
 REGEN_THINKING_BUDGET = _env_thinking("V5_REGEN_THINKING_BUDGET", 1024)
 
+# ── Refined mode (opt-in cost/latency tier, v5.10) ──────────────────────────
+#
+# Refined is the second quality tier alongside Advanced. Advanced stays the
+# DEFAULT; Refined is engaged only when the user flips the UI toggle. Refined
+# keeps everything that defines v5 quality IDENTICAL to Advanced:
+#   - image embedding (Stage 8 source routing + Stage 8b external sourcing
+#     with the stem-placement rule)
+#   - the global task / difficulty / answer-choice distributions (planned
+#     once over the whole deck; the planner is mode-agnostic)
+#   - the kernel-first trap architecture (4 distinct trap categories +
+#     sharedFeatures) and length parity
+#
+# It cuts cost + wall-time ~50% by trimming reasoning where the marginal
+# quality return is lowest:
+#   1. KERNEL thinking capped to 4096 (Advanced = uncapped -1). The trap
+#      structure still gets real reasoning room — just not unbounded, which
+#      is where Advanced spends 10-20K thinking tokens per question.
+#   2. STEM moves Pro -> Flash with a 1536 thinking budget. The kernel has
+#      already specified the verbatim clue + shared features; the stem is a
+#      constrained writing task, not a design task.
+#   3. CRITIC (the Pro per-distractor adversarial pass) runs ONLY on
+#      third_order OR difficult questions — the slots where multi-correct /
+#      no-defense failure modes actually surface. Easy / first / second-order
+#      questions skip the critic (and therefore its conditional regen +
+#      re-critic), which is the bulk of the Pro-token saving.
+#
+# Each refined knob is itself env-overridable for per-test tuning. The master
+# switch V5_REFINED=1 (set by the UI toggle in the generator subprocess env,
+# inherited through the entire spawn chain) is read by _default_mode() so
+# every organic generator picks up Refined with no per-runner flag plumbing.
+REFINED_KERNEL_THINKING_BUDGET = _env_thinking("V5_REFINED_KERNEL_THINKING_BUDGET", 4096)
+REFINED_STEM_MODEL = os.environ.get("V5_REFINED_STEM_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+REFINED_STEM_THINKING_BUDGET = _env_thinking("V5_REFINED_STEM_THINKING_BUDGET", 1536)
+
+
+def _default_mode() -> str:
+    """Resolve the generation mode from the environment.
+
+    The UI's Refined toggle sets V5_REFINED=1 in the generator subprocess
+    env; that var is inherited through the whole spawn chain (run_pipeline_job
+    -> profile runner -> generator -> generate_v5), so no per-runner CLI flag
+    threading is needed. Any truthy value (1/true/yes/on) selects refined;
+    anything else (incl. unset) keeps the Advanced default.
+    """
+    v = os.environ.get("V5_REFINED", "").strip().lower()
+    return "refined" if v in ("1", "true", "yes", "on") else "advanced"
+
 # Per-PDF parallelism (v5.4 Lever 1).
 #
 # Question slots within a single PDF run concurrently via ThreadPoolExecutor.
@@ -323,6 +370,7 @@ def stage_kernel(
     allowed_distractor_pool: list[str],
     slide_context: dict[str, Any],
     memory: dict[str, Any],
+    thinking_budget: int | None = None,
 ) -> dict[str, Any] | None:
     prompt = KERNEL_PROMPT_PATH.read_text(encoding="utf-8")
     prompt = (
@@ -335,7 +383,8 @@ def stage_kernel(
         .replace("{{SLIDE_CONTEXT_JSON}}", json.dumps(slide_context, ensure_ascii=False))
         .replace("{{MEMORY_JSON}}", json.dumps(memory, ensure_ascii=False))
     )
-    raw = gemini_call(prompt, model=KERNEL_MODEL, max_tokens=4096, thinking_budget=KERNEL_THINKING_BUDGET, temperature=0.5)
+    _kernel_thinking = KERNEL_THINKING_BUDGET if thinking_budget is None else thinking_budget
+    raw = gemini_call(prompt, model=KERNEL_MODEL, max_tokens=4096, thinking_budget=_kernel_thinking, temperature=0.5)
     parsed = parse_json_loose(raw)
     if not parsed:
         return None
@@ -368,6 +417,8 @@ def stage_stem(
     target_task: str,
     allowed_terms: list[str],
     slide_context: dict[str, Any],
+    model: str | None = None,
+    thinking_budget: int | None = None,
 ) -> dict[str, Any] | None:
     prompt = STEM_PROMPT_PATH.read_text(encoding="utf-8")
     prompt = (
@@ -379,7 +430,9 @@ def stage_stem(
         .replace("{{ALLOWED_TERMS_JSON}}", json.dumps(allowed_terms, ensure_ascii=False))
         .replace("{{SLIDE_CONTEXT_JSON}}", json.dumps(slide_context, ensure_ascii=False))
     )
-    raw = gemini_call(prompt, model=STEM_MODEL, max_tokens=4096, thinking_budget=STEM_THINKING_BUDGET, temperature=0.6)
+    _stem_model = model or STEM_MODEL
+    _stem_thinking = STEM_THINKING_BUDGET if thinking_budget is None else thinking_budget
+    raw = gemini_call(prompt, model=_stem_model, max_tokens=4096, thinking_budget=_stem_thinking, temperature=0.6)
     parsed = parse_json_loose(raw)
     if not parsed or not parsed.get("stem"):
         return None
@@ -973,10 +1026,24 @@ def generate_one_question(
     available_images: list[dict[str, Any]],
     rng: random.Random,
     external_budget: "ExternalImageBudget | None" = None,
+    mode: str = "advanced",
 ) -> dict[str, Any] | None:
     allowed_terms = allocation.get("allowedMedicalTerms") or []
     allowed_distractor_pool = allocation.get("allowedDistractorPool") or []
     slide_context = allocation.get("slideContext") or {}
+
+    # Refined mode (v5.10): identical pipeline, trimmed reasoning. Kernel
+    # thinking is capped, the stem runs on Flash, and the Pro critic is
+    # reserved for the slots that actually need adversarial review
+    # (third_order OR difficult). Everything else — distributions, image
+    # routing, length parity — is byte-for-byte the same as Advanced.
+    _refined = (mode == "refined")
+    _kernel_thinking = REFINED_KERNEL_THINKING_BUDGET if _refined else None
+    _stem_model = REFINED_STEM_MODEL if _refined else None
+    _stem_thinking = REFINED_STEM_THINKING_BUDGET if _refined else None
+    # Critic gate: Advanced always runs it; Refined runs it only where
+    # multi-correct / no-defense failure modes concentrate.
+    run_critic = (not _refined) or (target_order == "third_order") or (target_difficulty == "difficult")
 
     # Stage 2: KERNEL
     kernel = stage_kernel(
@@ -987,6 +1054,7 @@ def generate_one_question(
         allowed_distractor_pool=allowed_distractor_pool,
         slide_context=slide_context,
         memory=memory,
+        thinking_budget=_kernel_thinking,
     )
     if not kernel:
         return None
@@ -999,6 +1067,8 @@ def generate_one_question(
         target_task=target_task,
         allowed_terms=allowed_terms,
         slide_context=slide_context,
+        model=_stem_model,
+        thinking_budget=_stem_thinking,
     )
     if not stem_obj:
         return None
@@ -1013,6 +1083,11 @@ def generate_one_question(
         return None
 
     # Stage 5: CRITIC (per-distractor + adversarial)
+    # Advanced always runs the critic. Refined runs it only on the slots
+    # that need it (third_order OR difficult); otherwise critic=None, which
+    # cleanly short-circuits the regen pass, the reject check, and the
+    # acceptance loop below (each guards on `if critic`), and assemble_question
+    # tolerates a None critic_obj.
     critic = stage_critic(
         stem=stem_obj["stem"],
         correct_answer_text=correct_text,
@@ -1021,7 +1096,7 @@ def generate_one_question(
         kernel=kernel,
         target_order=target_order,
         target_difficulty=target_difficulty,
-    )
+    ) if run_critic else None
     verdict = (critic or {}).get("verdict", "")
 
     # Stage 6: TARGETED REGEN
@@ -1110,7 +1185,8 @@ def generate_one_question(
     img_opp = (kernel.get("imageOpportunity") or "none").strip().lower()
     _src_attached = bool((image_route or {}).get("attach"))
     print(
-        f"[v5-img] Q{question_number} task={target_task} order={target_order} "
+        f"[v5-img] Q{question_number} mode={mode} task={target_task} order={target_order} "
+        f"critic={'on' if run_critic else 'off'} "
         f"imageOpportunity={img_opp} sourceImageAttached={_src_attached} "
         f"externalSourcing={'on' if external_budget is not None else 'off'}",
         file=sys.stderr,
@@ -1241,7 +1317,14 @@ def generate_v5(
     max_workers: int | None = None,
     external_images: bool | None = None,
     max_external_images: int | None = None,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
+    # Resolve the quality tier. Callers may pass mode explicitly; otherwise
+    # it comes from the V5_REFINED env master switch (set by the UI's Refined
+    # toggle, inherited through the spawn chain). Advanced is the default.
+    mode = mode or _default_mode()
+    if mode not in ("advanced", "refined"):
+        mode = "advanced"
     target_order_mix = target_order_mix or {
         "first_order": 0.25,
         "second_order": 0.45,
@@ -1339,6 +1422,22 @@ def generate_v5(
     else:
         print("[v5-ext] external images OFF", file=sys.stderr)
 
+    # One-line tier summary so a run is self-documenting from the log alone.
+    if mode == "refined":
+        print(
+            f"[v5-mode] REFINED — kernel thinking={REFINED_KERNEL_THINKING_BUDGET}, "
+            f"stem={REFINED_STEM_MODEL}@{REFINED_STEM_THINKING_BUDGET}, "
+            f"critic on third_order|difficult only "
+            f"(images / distributions / length parity identical to Advanced)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[v5-mode] ADVANCED — kernel thinking={KERNEL_THINKING_BUDGET}, "
+            f"stem={STEM_MODEL}@{STEM_THINKING_BUDGET}, critic always on",
+            file=sys.stderr,
+        )
+
     # Memory is a shared mutable dict. With parallel question generation,
     # all Qs in a batch see the SAME initial memory (since they all start
     # before any complete), so the dedup signal it carries is largely lost
@@ -1358,6 +1457,7 @@ def generate_v5(
                 available_images=task["slide_images"],
                 rng=task["rng"],
                 external_budget=external_budget,
+                mode=mode,
             )
         except Exception as exc:
             print(f"[v5.4] Q{task['qn']} pipeline error: {exc}", file=sys.stderr)
@@ -1421,6 +1521,12 @@ def _smoke_test_cli() -> int:
     parser.add_argument("--allocation-file", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mode",
+        choices=("advanced", "refined"),
+        default=None,
+        help="Quality tier. Default resolves from V5_REFINED env (advanced if unset).",
+    )
     args = parser.parse_args()
     allocations = json.loads(Path(args.allocation_file).read_text(encoding="utf-8"))
     if not isinstance(allocations, list):
@@ -1433,6 +1539,7 @@ def _smoke_test_cli() -> int:
         allocations=allocations,
         memory=memory,
         seed=args.seed,
+        mode=args.mode,
     )
     elapsed = time.time() - started
     out_path = Path(args.out)

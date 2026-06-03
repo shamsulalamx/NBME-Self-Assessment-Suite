@@ -2762,6 +2762,23 @@ body.quiz-fullscreen-mode #modal-lab  { z-index: 10002 !important; }
             </select>
           </div>
         </div>
+        <!-- v5.10: Refined quality tier. Opt-in; Advanced (critic on every
+             question, uncapped kernel reasoning, Pro stem) stays the default.
+             Visible for every source that supports Advanced Mode since the
+             tier applies to all organic v5 generators. Maps to
+             advancedConfig.refined, which run_pipeline_job turns into
+             V5_REFINED=1 in the generator subprocess env. -->
+        <div data-advanced-knobs-row="refined" style="margin-top:10px;">
+          <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;margin:0;font-size:12px;color:#334155;">
+            <input type="checkbox" id="bic-refined-mode" onchange="App.refreshAdvancedCostPreview()" style="margin-top:2px;flex-shrink:0;">
+            <span>
+              <strong>Refined mode</strong> <span style="color:#2f855a;">(~50% cheaper &amp; faster)</span>
+              <span style="display:block;font-size:11px;color:#5a6a7a;margin-top:1px;">
+                Identical images, question types, difficulty &amp; answer-choice mix. Caps kernel reasoning, writes stems on the faster model, and runs the adversarial critic only on the hardest questions (third-order or difficult). Leave off for maximum quality (default).
+              </span>
+            </span>
+          </label>
+        </div>
         <div id="bic-advanced-cost-preview" style="margin-top:8px;padding:6px 8px;background:#fff;border:1px solid #e2e8f0;border-radius:3px;font-size:11px;color:#334155;line-height:1.5;">
           Select file(s) to see a cost &amp; question-count estimate.
         </div>
@@ -25562,6 +25579,10 @@ Errors: ${escapeHTML(errors)}</div>
     } else {
       row.style.display = 'none';
       checkbox.checked = false;
+      // v5.10: also clear the Refined sub-toggle so a stale "on" can't carry
+      // to a source that doesn't run the v5 pipeline.
+      const refinedCb = document.getElementById('bic-refined-mode');
+      if (refinedCb) refinedCb.checked = false;
       if (labelSpan) labelSpan.textContent = 'Advanced Mode';
     }
     refreshAdvancedModePanel();
@@ -25611,6 +25632,9 @@ Errors: ${escapeHTML(errors)}</div>
     if (!out) return;
     const chunkSize = Math.max(1, parseInt(document.getElementById('bic-chunk-size')?.value || '1500', 10));
     const qPerChunk = Math.max(1, parseInt(document.getElementById('bic-questions-per-chunk')?.value || '2', 10));
+    // v5.10: Refined trims ~50% off both cost and wall time (capped kernel
+    // reasoning, Flash stem, critic only on the hardest questions).
+    const refined = !!document.getElementById('bic-refined-mode')?.checked;
     const files = Array.isArray(_batchImportState?.files) ? _batchImportState.files : [];
     if (!files.length) {
       out.innerHTML = 'Select file(s) to see a cost &amp; question-count estimate.';
@@ -25621,7 +25645,7 @@ Errors: ${escapeHTML(errors)}</div>
     // If the API isn't available, render a chunk-size-aware fallback.
     const api = window.nbmeDesktop && window.nbmeDesktop.batchImport;
     if (!api || !api.fileSize) {
-      out.innerHTML = `<span style="color:#5a6a7a;">Settings: ${chunkSize}-char chunks &times; ${qPerChunk} questions per chunk.</span> <span style="color:#7a8a9a;">(file-size lookup unavailable; estimate hidden)</span>`;
+      out.innerHTML = `<span style="color:#5a6a7a;">Settings: ${chunkSize}-char chunks &times; ${qPerChunk} questions per chunk${refined ? ' &middot; Refined tier' : ''}.</span> <span style="color:#7a8a9a;">(file-size lookup unavailable; estimate hidden)</span>`;
       return;
     }
     Promise.all(files.map(p => api.fileSize(p).catch(() => 0)))
@@ -25638,15 +25662,22 @@ Errors: ${escapeHTML(errors)}</div>
         const eligibleChars = Math.floor(estChars * 0.8);
         const numChunks = Math.max(1, Math.floor(eligibleChars / chunkSize));
         const totalQ = numChunks * qPerChunk;
-        // v5.6 per-Q cost estimate: ~$0.14 (Pro Kernel + 1024 Stem,
-        // Flash Distractors, Pro 2048 Critic, longer explanations).
-        const cost = totalQ * 0.14;
-        // Wall-time estimate: ~80 s/Q sequential at v5.6 budgets,
-        // ÷5 parallel workers, clamped to 120 s minimum (one chunk
-        // through the full pipeline can't go below ~2 min wall).
-        const wallSec = Math.max(120, Math.floor(totalQ * 80 / 5));
+        // Per-Q estimates. Advanced (v5.6 budgets): ~$0.14, ~80 s/Q
+        // sequential (Pro Kernel uncapped + Pro Stem + Pro Critic on every
+        // question). Refined (v5.10): ~$0.07, ~40 s/Q — capped kernel
+        // reasoning, Flash stem, critic only on third-order/difficult slots.
+        const perQCost = refined ? 0.07 : 0.14;
+        const perQSec = refined ? 40 : 80;
+        const cost = totalQ * perQCost;
+        // Wall-time estimate: per-Q seconds ÷5 parallel workers, clamped to a
+        // floor (one chunk through the full pipeline has an irreducible wall).
+        const floorSec = refined ? 75 : 120;
+        const wallSec = Math.max(floorSec, Math.floor(totalQ * perQSec / 5));
         const wallMin = Math.ceil(wallSec / 60);
         const fmtFiles = files.length === 1 ? '1 file' : `${files.length} files`;
+        const tierLabel = refined
+          ? `<span style="color:#2f855a;font-weight:600;">Refined tier</span>`
+          : `<span style="color:#5a6a7a;">Advanced tier</span>`;
         out.innerHTML = (
           `<div><strong>Estimate</strong> from ${fmtFiles} (~${Math.round(totalBytes/1024)} KB raw, ~${Math.round(estChars/1000)}K chars extracted):</div>` +
           `<div style="margin-top:4px;">` +
@@ -25654,7 +25685,7 @@ Errors: ${escapeHTML(errors)}</div>
           `<strong>~$${cost.toFixed(2)}</strong> &middot; ` +
           `<strong>~${wallMin} min</strong> wall (5 workers)` +
           `</div>` +
-          `<div style="margin-top:2px;color:#7a8a9a;">${numChunks} chunks &times; ${qPerChunk} Q/chunk. ` +
+          `<div style="margin-top:2px;color:#7a8a9a;">${tierLabel} &middot; ${numChunks} chunks &times; ${qPerChunk} Q/chunk. ` +
           `Actual count varies by extracted text density.</div>`
         );
       })
@@ -25732,6 +25763,8 @@ Errors: ${escapeHTML(errors)}</div>
     const advancedConfig = {
       chunkSize: Math.max(0, parseInt(document.getElementById('bic-chunk-size')?.value || '0', 10)),
       questionsPerChunk: Math.max(0, parseInt(document.getElementById('bic-questions-per-chunk')?.value || '0', 10)),
+      // v5.10: opt-in Refined quality tier (main.js gates it on advancedMode).
+      refined: !!document.getElementById('bic-refined-mode')?.checked,
     };
     const buildJob = function(paths) {
       return {
@@ -26102,6 +26135,8 @@ Errors: ${escapeHTML(errors)}</div>
     const advancedConfig = {
       chunkSize: Math.max(0, parseInt(document.getElementById('bic-chunk-size')?.value || '0', 10)),
       questionsPerChunk: Math.max(0, parseInt(document.getElementById('bic-questions-per-chunk')?.value || '0', 10)),
+      // v5.10: opt-in Refined quality tier (main.js gates it on advancedMode).
+      refined: !!document.getElementById('bic-refined-mode')?.checked,
     };
     try {
     const result = await api.launchJob({

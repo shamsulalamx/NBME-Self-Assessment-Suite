@@ -404,6 +404,23 @@ def manifest_advanced_config_args(manifest: dict[str, Any]) -> list[str]:
     return extra
 
 
+def manifest_refined_enabled(manifest: dict[str, Any]) -> bool:
+    """v5.10: Refined is an opt-in quality tier WITHIN Advanced Mode. It only
+    applies when advancedMode is on (the v5 pipeline itself is gated behind
+    advancedMode via the registry's --v5 advancedArgs) AND advancedConfig.refined
+    is true. Engaged purely by exporting V5_REFINED=1 into the generator
+    subprocess env (done in run_command): the v5 pipeline reads it via
+    _default_mode(), and the var is inherited through the entire downstream
+    spawn chain (profile runner -> generator), so no per-runner CLI flag
+    plumbing is needed."""
+    if not bool(manifest.get("advancedMode")):
+        return False
+    cfg = manifest.get("advancedConfig") or {}
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("refined"))
+
+
 def command_steps(source: dict[str, Any], dry_run: bool) -> list[dict[str, Any]]:
     steps_key = "dryRunSteps" if dry_run else "liveSteps"
     args_key = "dryRunArgs" if dry_run else "liveArgs"
@@ -508,6 +525,14 @@ def run_command(source: dict[str, Any], manifest: dict[str, Any], input_file: Pa
     )
     emit("command_start", cwd=str(cwd), command=cmd, stepIndex=step_index, stageLabel=stage_label)
     env = os.environ.copy()
+    # v5.10: Refined quality tier. Exporting V5_REFINED=1 here is the ONLY
+    # backend plumbing required — the v5 pipeline reads it via _default_mode()
+    # and every spawn in the downstream chain inherits the parent env (the
+    # profile runners pass env={**os.environ} or no env= at all), so the tier
+    # rides along to generate_v5 without threading a flag through any runner.
+    if manifest_refined_enabled(manifest):
+        env["V5_REFINED"] = "1"
+        emit("pipeline_progress", phase=stage, message="Refined mode ON (v5 cost/latency tier)", stage=stage, stageLabel=stage_label, stepIndex=step_index)
     durable_root = job_output_root(manifest)
     if durable_root:
         durable_root.mkdir(parents=True, exist_ok=True)

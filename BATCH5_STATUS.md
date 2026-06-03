@@ -1,11 +1,13 @@
 # BATCH 5 — Organic generator quality overhaul (v5)
 
 Branch: `phase12-vertex-migration`
-Tag: `v5.9-batch5-pending-validation` (latest). v5.6.1 is the most
-recent `-stable`; v5.7 + v5.8 + v5.9 await `-stable` promotion.
-v5.9 WAS user-verified on a rebuilt `.app` — both the image-in-stem
-fix and the task-variety fix confirmed on a live OME run — so its
-promotion to `-stable` only awaits the user's explicit go-ahead.
+Tag: `v5.10-batch5-stable` (latest). This stable tag bundles
+everything from v5.7 through v5.10: Advanced Mode for all organic
+sources (v5.7 Fast Facts/Emma, v5.8 UWorld/Mehlman/Anki/Divine), the
+image-in-stem + global task-variety fixes (v5.9), and the new opt-in
+**Refined** quality tier (v5.10). It supersedes the earlier
+`v5.7/v5.8/v5.9-batch5-pending-validation` tags — their changes are
+all included here. The user approved promotion to `-stable`.
 
 ## Scope (very important): organic-generation only
 
@@ -52,6 +54,7 @@ shipped in `v4.85-batch4-stable`.
 | `v5.7-batch5-pending-validation` | Advanced Mode for Fast Facts PPTX + Emma Holliday PDF. Registry config for Fast Facts; registry + `--v5` flag forwarding in `emma_profile_runner.py`. UI gates chunk-size + Q-per-chunk knobs on new `supportsChunkControls` registry flag (OME-only today). Group B deferred. Code shipped; `.app` rebuild + smoke + `-stable` deferred until user's running queue completes. |
 | `v5.8-batch5-pending-validation` | **Advanced Mode for all of Group B (UWorld notes + Mehlman PDF + Anki notes + Divine podcasts).** OME's v5.3 adapter promoted to shared `tools/shared-ingestion/v5_uworld_family_adapter.py` with a `process_file_v5_uworld_family()` helper. Each Group B generator + profile runner now accepts `--v5` flags. Registry: supportsAdvancedMode + advancedArgs for all 4 sources; supportsChunkControls for UWorld/Anki/Divine (Mehlman hides chunk knobs because its legacy CLI already owns `--questions-per-chunk`). Code shipped; same deferral as v5.7. |
 | `v5.9-batch5-pending-validation` | **Two user-caught bugs on the organic Advanced Mode pipeline, both fixed in CODE (not prompt nudges).** (1) **Image-in-stem:** borrowed external images appeared ONLY in answer explanations, never in stems — even when the stem's discriminating clue literally cited the image ("an abdominal radiograph shows…"), producing questions referencing an invisible film. Root cause: Stage 8b set `placement` from the model's choice, which was "explanation" 100% of the time. Fix: placement now decided in code via `stem_references_image()` (regex over the stem + discriminating clue) → STEM when the vignette cites an image, EXPLANATION otherwise. (2) **Task variety:** every question was "next step in management/diagnosis"; the four low-weight tasks (mechanism, causative_agent, expected_finding, complication) never appeared. Root cause: `plan_allocation_slots` ran PER CHUNK with a small n (~3), so largest-remainder rounding funded only the top-3 weighted tasks and zeroed the other four in every chunk. Fix: plan all three dimensions GLOBALLY across the whole deck, then deal slots to chunks by cursor. Partner prompt edits separate ORDER (reasoning depth) from TASK (what is asked) and thread `{{TARGET_TASK}}` into the kernel + stem prompts so the correct answer + final question match the assigned task. Also: `.q-img-credit` attribution line under borrowed images (CC BY/BY-SA), `external_image_source.py` query-ladder + retry, and `targetTask` recorded in v5 debug artifacts. Single shared `v5_pipeline.py` — all organic generators (OME, UWorld, Mehlman, Anki, Divine, lecture-slide) inherit both fixes; NBME/AMBOSS verbatim untouched. **User verified both fixes on a rebuilt `.app` (live OME run): "everything looks good."** |
+| `v5.10-batch5-stable` | **Opt-in "Refined" quality tier alongside Advanced (still the default).** A single `Refined mode` toggle inside the Advanced Mode panel engages a cheaper/faster pass that keeps image embedding (Stage 8/8b + stem-placement rule), the task/difficulty/answer-choice distributions, the kernel-first trap design, and length parity **identical to Advanced**. It trims reasoning where the marginal quality return is lowest: kernel thinking capped at 4096 (vs uncapped `-1`), stems written on `gemini-2.5-flash`@1536 (vs Pro), and the Pro adversarial critic run **only** on `third_order` OR `difficult` questions (everything else skips critic + its regen). Projected ~50% cost + wall-time cut. Implemented as a `V5_REFINED=1` env master switch set by `run_pipeline_job.py` (from `advancedConfig.refined`) and inherited through the whole subprocess spawn chain; `generate_v5(mode=…)` defaults via `_default_mode()`, so **all 7 organic generators** (OME, Fast Facts, Emma, UWorld, Mehlman, Anki, Divine) pick it up with zero per-runner flag plumbing. UI cost preview halves and shows the tier. NBME/AMBOSS verbatim untouched. |
 
 ## v5.3 — OME organic generator port
 
@@ -1386,3 +1389,115 @@ fixed global default. NBME and AMBOSS verbatim extraction never call
 - **User click-through:** verified both fixes on the rebuilt `.app` via a
   live OME run — "everything looks good." `-pending-validation` suffix
   held per CLAUDE.md until the user explicitly approves `-stable`.
+
+## v5.10 — Refined mode (opt-in cheaper/faster tier)
+
+A second quality tier, **Refined**, sits next to Advanced. Advanced stays
+the default; Refined is engaged ONLY when the user ticks the new toggle.
+The goal: cut per-question cost and wall-time by roughly half **without
+changing anything that shapes the question's content or shape** — image
+embedding, the task / difficulty / answer-choice distributions, the
+kernel-first trap design, and length parity all stay byte-for-byte
+identical to Advanced. Refined trims only the reasoning compute where the
+marginal quality return is lowest.
+
+### What stays identical to Advanced
+
+- **Images:** Stage 8 (image route) + Stage 8b (external sourcing) +
+  the v5.9 `stem_references_image()` placement rule are unchanged. A
+  Refined question embeds the same image in the same place.
+- **Distributions:** order / difficulty / task planning is the same
+  global planner from v5.9. Same answer-choice count + shuffle.
+- **Trap design + length parity:** kernel-first distractor authorship,
+  the four trap categories, per-distractor scoring, and the length-parity
+  pass all run exactly as in Advanced.
+
+### The three levers (the only differences)
+
+1. **Kernel thinking capped at 4096** (vs Advanced's uncapped `-1`).
+   `REFINED_KERNEL_THINKING_BUDGET` — `v5_pipeline.py:199`.
+2. **Stems written on `gemini-2.5-flash`@1536 thinking** (vs Pro).
+   `REFINED_STEM_MODEL` / `REFINED_STEM_THINKING_BUDGET` —
+   `v5_pipeline.py:200-201`.
+3. **Pro adversarial critic runs ONLY on `third_order` OR `difficult`
+   questions.** Everything else skips the critic *and* its regen pass:
+   `run_critic = (not _refined) or (target_order == "third_order") or
+   (target_difficulty == "difficult")` — `v5_pipeline.py:1046`. The
+   critic call is then gated (`critic = stage_critic(...) if run_critic
+   else None`), and because `assemble_question` reads `(critic or {})`
+   and every regen/reject branch guards on `if critic`, `critic=None`
+   short-circuits cleanly with no downstream `None` deref.
+
+Projected ~50% cost + wall-time cut, concentrated on the bulk
+first/second-order, easy/medium questions; the hardest questions still
+get the full Pro critic, so the top of the difficulty curve is unchanged.
+
+### Architecture — one env switch, zero per-runner plumbing
+
+The mode is carried by a single environment variable, `V5_REFINED=1`,
+set once and inherited through the whole subprocess spawn chain. No
+generator or profile runner needs a new flag.
+
+```
+UI checkbox  #bic-refined-mode
+  → renderer advancedConfig.refined            (index.html, 2 build sites)
+  → IPC → sanitizeBatchJobPayload              (electron/main.js:824-832,
+                                                gated on advancedMode)
+  → manifest advancedConfig.refined
+  → manifest_refined_enabled(manifest)         (run_pipeline_job.py:407)
+  → env["V5_REFINED"] = "1"                     (run_pipeline_job.py:534)
+  → spawn chain inherits env
+  → _default_mode() → "refined"                 (v5_pipeline.py:204)
+  → generate_v5(mode=…)                          (v5_pipeline.py:1325)
+  → generate_one_question(mode=…)                (v5_pipeline.py:1029)
+```
+
+- **electron/main.js was the critical catch.** `sanitizeBatchJobPayload`
+  rebuilds `advancedConfig` from scratch (only `chunkSize` /
+  `questionsPerChunk`), so the renderer's `refined` key would have been
+  silently dropped. Fixed by re-adding `refined` there, gated on
+  `advancedMode` (not on `supportsChunkControls` — Refined applies even
+  to sources like Mehlman that hide the chunk knobs).
+- **`_default_mode()`** reads `V5_REFINED` (`1/true/yes/on` → refined),
+  so the same `generate_v5` works for every entry point — CLI smoke test
+  (`--mode`), the family adapter (in-process), and every profile runner
+  (which inherit the parent env). **All 7 organic generators** — OME,
+  Fast Facts, Emma, UWorld, Mehlman, Anki, Divine — pick Refined up with
+  no code change of their own.
+- A `[v5-mode]` line (`v5_pipeline.py:1428`) prints the active tier and
+  its levers to the pipeline log at run start.
+
+### UI
+
+A single checkbox, **"Refined mode (~50% cheaper & faster)"**, inside the
+existing Advanced Mode panel (below the chunk row). The cost preview
+reacts live: per-Q estimate `$0.14 → $0.07`, per-Q time `80s → 40s`,
+floor `120s → 75s`, and the tier label switches to "Refined tier". The
+box resets to unchecked whenever Advanced Mode is turned off.
+
+### Scope / cross-platform
+
+Refined rides the same single shared `v5_pipeline.py` as everything else,
+so it is automatically uniform across all organic generators. The 3
+verbatim extractors (NBME / AMBOSS / images_tables) never call
+`generate_v5` and never see `V5_REFINED` — they are untouched, exactly as
+in `v4.85-batch4-stable`.
+
+### Verification at ship
+
+- `python3 -m py_compile` clean on `v5_pipeline.py` + `run_pipeline_job.py`;
+  `node --check` clean on `electron/main.js`; `index.html` checkbox + both
+  advancedConfig build sites present.
+- All v5.10 markers present at the cited lines (preset block 199-201,
+  `_default_mode` 204, `mode` param 1029, lever branching 1040-1046,
+  `mode = mode or _default_mode()` 1325, `[v5-mode]` trace 1428;
+  `manifest_refined_enabled` 407 + `env["V5_REFINED"]` 534; main.js
+  `refined` 824-832).
+- 29-check mock test of the mode-branch logic passed (env parsing,
+  critic-gate truth table, None-critic short-circuit).
+- Source ↔ packaged-bundle MD5 **match** on the runtime files after
+  `npm run electron:build:mac`.
+- **Honest accounting (raised to the user before promotion):** no live UI
+  click-through and no real generation were run this round — only static
+  checks, the mock logic test, and the build MD5. The user reviewed that
+  caveat and explicitly approved promotion to `-stable` ("go").

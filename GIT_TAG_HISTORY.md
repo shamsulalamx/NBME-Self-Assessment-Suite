@@ -1,10 +1,37 @@
 # Git Tag History
 
-Last updated: 2026-05-28
+Last updated: 2026-06-02
 
-This file documents stable v4 tags from v4.0 through the current head tag `v4.80.2-nbme-pair-detection-fix-stable`. Each entry records the commit, what was added or stabilized, what evidence supports it, and what architectural significance it carries.
+This file documents stable tags through the current head tag `v5.10-batch5-stable`. Each entry records the commit, what was added or stabilized, what evidence supports it, and what architectural significance it carries. The full v5 (Batch 5 organic-generator) lineage — v5.0 through v5.10, with per-version detail — lives in `BATCH5_STATUS.md`; only the current v5 head tag is mirrored here.
 
 Note on the recent v4.62–v4.80 batch: many of these tags shipped with source-level proof only (`node --check` clean + `.app` rebuilt + bundled-marker count). That is NOT verification of behavior, and several of those tags introduced regressions caught only when the user exercised the scenarios live. v4.80.1 codified this as a binding rule via the new `CLAUDE.md` working-agreement file: no `-stable` suffix without user click-through verification. v4.80.2 follows that rule — tag earned via real "Detected 1 NBME pair" UI confirmation by the user after re-selecting files in the rebuilt .app.
+
+## v5.10-batch5-stable
+
+Current head tag. Promoted to `-stable` on 2026-06-02 at the user's explicit instruction ("update all docs, tag, commit, push everywhere as stable" → "go"), after the verification caveat below was raised and accepted. This stable tag bundles the whole v5.7→v5.10 stretch of Batch 5 — Advanced Mode for all organic sources (v5.7 Fast Facts/Emma, v5.8 UWorld/Mehlman/Anki/Divine), the image-in-stem + global task-variety fixes (v5.9), and the new opt-in **Refined** tier (v5.10) — and supersedes the `v5.7/v5.8/v5.9-batch5-pending-validation` tags. Full per-version detail is in `BATCH5_STATUS.md`.
+
+Commit: bundled `electron/main.js` + `index.html` + `tools/batch-import-center/run_pipeline_job.py` + `tools/lecture-slide-question-generator/v5_pipeline.py` + `BATCH5_STATUS.md` + this entry, single v5.10 commit on `phase12-vertex-migration`.
+
+Meaning: An opt-in second quality tier, **Refined**, beside the existing Advanced tier (Advanced stays the default). A single `Refined mode` toggle inside the Advanced Mode panel engages a cheaper/faster pass that keeps everything content-shaping — image embedding (Stage 8/8b + the v5.9 stem-placement rule), the task/difficulty/answer-choice distributions, kernel-first trap design, and length parity — **identical to Advanced**, and trims only the reasoning compute with the lowest marginal quality return.
+
+The three levers (the only differences from Advanced):
+1. Kernel thinking capped at 4096 (vs Advanced's uncapped `-1`) — `v5_pipeline.py:199`.
+2. Stems on `gemini-2.5-flash`@1536 thinking (vs Pro) — `v5_pipeline.py:200-201`.
+3. The Pro adversarial critic (and its regen pass) runs ONLY on `third_order` OR `difficult` questions; everything else skips it — `run_critic` at `v5_pipeline.py:1046`, with the critic call gated to `None` otherwise (which short-circuits cleanly because `assemble_question` reads `(critic or {})` and every regen/reject branch guards on `if critic`).
+
+Projected ~50% cost + wall-time cut, concentrated on the bulk first/second-order easy/medium questions; the hardest questions still get the full Pro critic.
+
+Architecture: one env-var master switch, **zero per-runner plumbing**. The flow is UI checkbox `#bic-refined-mode` → renderer `advancedConfig.refined` (index.html, 2 build sites) → IPC → `sanitizeBatchJobPayload` (`electron/main.js:824-832`, gated on `advancedMode`) → manifest → `manifest_refined_enabled` (`run_pipeline_job.py:407`) → `env["V5_REFINED"]="1"` (`run_pipeline_job.py:534`) → inherited through the whole subprocess spawn chain → `_default_mode()` (`v5_pipeline.py:204`) → `generate_v5(mode=…)` → `generate_one_question(mode=…)`. Because the switch lives in the inherited environment and `_default_mode()` reads it, **all 7 organic generators** (OME, Fast Facts, Emma, UWorld, Mehlman, Anki, Divine) pick Refined up with no flag of their own. The single most important catch was `electron/main.js`: `sanitizeBatchJobPayload` rebuilds `advancedConfig` from scratch, so without re-adding `refined` there the renderer's key would have been silently dropped. NBME/AMBOSS/images_tables verbatim extraction never call `generate_v5` and are untouched.
+
+Validated (source + mock + build only — NOT user click-through, NOT a live generation):
+1. `python3 -m py_compile` clean on `v5_pipeline.py` + `run_pipeline_job.py`; `node --check` clean on `electron/main.js`; `index.html` checkbox + both `advancedConfig` build sites present.
+2. All v5.10 markers present at the cited lines (preset block 199-201, `_default_mode` 204, `mode` param 1029, lever branching 1040-1046, `mode = mode or _default_mode()` 1325, `[v5-mode]` trace 1428; `manifest_refined_enabled` 407 + `env["V5_REFINED"]` 534; main.js `refined` 824-832).
+3. 29-check mock test of the mode-branch logic (env parsing, critic-gate truth table, None-critic short-circuit) — all passed.
+4. `npm run electron:build:mac` succeeded; source ↔ packaged-bundle MD5 match on the runtime files.
+
+Not validated by this milestone (the caveat the user accepted before promotion): no live UI click-through of the toggle, and no real generation run (which would spend API budget) to confirm the projected ~50% cost/time cut or compare Refined vs Advanced output quality. The user reviewed this explicitly and chose to promote to `-stable` anyway.
+
+Architecture significance: Demonstrates the **inherited-env master-switch** pattern for fanning one user toggle out to many independent generators without touching each one — viable here only because every organic generator shares a single `v5_pipeline.py` and the spawn chain never strips the parent env. Also a fresh instance of the **sanitizer-rebuilds-the-payload** trap (a passthrough field is dropped unless the sanitizer is taught about it), the same class of issue that has bitten config flow before.
 
 ## v4.85.2-renderer-ui-labtables-stable
 
