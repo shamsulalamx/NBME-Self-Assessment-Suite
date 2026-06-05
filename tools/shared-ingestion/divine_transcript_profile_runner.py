@@ -87,18 +87,39 @@ def run_divine_generator(
         command.extend(v5_args)
     emit("divine_downstream_start", command=command, outputRoot=str(output_root), live=live)
     started_at = time.time()
-    proc = subprocess.run(
+    # v5.12.1: stream the child live and forward its per-question BIC_PROGRESS
+    # lines so the BIC progress bar shows %/ETA in real time. The old
+    # subprocess.run(PIPE) buffered all output and surfaced it only AFTER the
+    # child exited, so the bar never moved — only run_pipeline_job's 60s
+    # heartbeat showed. stderr is merged into stdout (single drain, no
+    # pipe-buffer deadlock); non-progress lines are kept as a rolling tail for
+    # the post-run report. BIC_PROGRESS_SOURCE is set explicitly so the child
+    # emits progress even if the inherited value is empty.
+    proc = subprocess.Popen(
         command,
         cwd=str(PROJECT_ROOT),
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        env={**os.environ, "BIC_PROGRESS_SOURCE": os.environ.get("BIC_PROGRESS_SOURCE") or SOURCE_TYPE},
     )
+    assert proc.stdout is not None
+    tail: list[str] = []
+    for line in proc.stdout:
+        message = line.rstrip("\n")
+        if not message:
+            continue
+        if message.startswith("BIC_PROGRESS "):
+            print(message, flush=True)
+        else:
+            tail.append(message)
+            if len(tail) > 400:
+                tail = tail[-200:]
+    proc.wait()
     runtime = round(time.time() - started_at, 3)
-    if proc.stdout.strip():
-        emit("divine_downstream_stdout", message=proc.stdout.strip()[-4000:])
-    if proc.stderr.strip():
-        emit("divine_downstream_stderr", message=proc.stderr.strip()[-4000:])
+    combined = "\n".join(tail).strip()
+    if combined:
+        emit("divine_downstream_stdout", message=combined[-4000:])
     if proc.returncode != 0:
         mode_label = "live" if live else "dry-run"
         raise RuntimeError(f"Divine generator {mode_label} exited with code {proc.returncode}.")

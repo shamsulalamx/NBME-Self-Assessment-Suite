@@ -665,6 +665,13 @@ def _process_cleaned_transcript(
     )
     _uw.log(f"  {len(chunks)} chunk(s) → {chunk_path.name}")
 
+    # v5.12.3: BIC progress denominator. Divine's chunker (like the shared
+    # uworld-family one) floors at >=1 question per chunk, so a small
+    # questions_per_file on a long transcript yields ~len(chunks) questions.
+    # Use the true expected total = max(questions_per_file, len(chunks)) so the
+    # bar doesn't freeze at 100% while generation keeps going.
+    expected_total = max(int(questions_per_file), len(chunks))
+
     all_questions: List[Dict] = []
     file_warnings: List[str] = []
     chunk_stats: List[Dict] = []
@@ -687,6 +694,17 @@ def _process_cleaned_transcript(
         remainder = questions_per_file - qpc * len(chunks)
         q_offset = 0
         raw_generated: List[Dict] = []
+        # v5.12.2/.3: live BIC progress for Divine's legacy loop. Divine has its
+        # OWN chunk loop (calls _uw.call_gemini_with_retry directly) rather than
+        # _uw.process_file, so it needs its own emit calls. Reuses the shared
+        # emitter on the _uw module. expected_total is the true denominator.
+        _uw._emit_bic_progress(
+            phase="generating",
+            message=f"Starting generation: 0 of {expected_total} question(s)",
+            question=0,
+            questionTotal=expected_total,
+            chunkTotal=len(chunks),
+        )
 
         for ci, chunk in enumerate(chunks):
             n = qpc + (1 if ci < remainder else 0)
@@ -726,6 +744,14 @@ def _process_cleaned_transcript(
                 c_stat["error"] = str(exc)
 
             chunk_stats.append(c_stat)
+            _uw._emit_bic_progress(
+                phase="generating",
+                message=f"Generated {len(all_questions)} of {expected_total} question(s)",
+                question=len(all_questions),
+                questionTotal=expected_total,
+                chunk=ci + 1,
+                chunkTotal=len(chunks),
+            )
 
         dup_warnings = _uw.check_duplicate_stems(all_questions)
         if dup_warnings:
@@ -738,6 +764,12 @@ def _process_cleaned_transcript(
         _uw.log(f"  Generated JSON → {gen_path.name} ({len(raw_generated)} questions)")
 
     # Build and write app-ready JSON
+    _uw._emit_bic_progress(
+        phase="writing",
+        message=f"Finalizing {len(all_questions)} question(s)",
+        question=len(all_questions),
+        questionTotal=expected_total,
+    )
     app_json = _uw.build_app_ready_json(stem, all_questions, file_warnings)
     app_path = APP_DIR / f"{stem}_app_ready.json"
     app_path.write_text(json.dumps(app_json, indent=2), encoding="utf-8")

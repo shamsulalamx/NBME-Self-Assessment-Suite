@@ -259,6 +259,51 @@ def _genai_types() -> Any:
     return t
 
 
+def _v5_is_transient_api_failure(exc: Exception) -> bool:
+    """True for HTTP 429 / RESOURCE_EXHAUSTED quota limits and transient network
+    blips — the cases worth waiting out rather than dropping a question/stage.
+    Text-matched because the google-genai SDK surfaces these as differently
+    typed exceptions."""
+    text = str(exc).lower()
+    return any(
+        s in text
+        for s in (
+            "429",
+            "resource_exhausted",
+            "resource exhausted",
+            "quota",
+            "rate limit",
+            "too many requests",
+            "deadline exceeded",
+            "service unavailable",
+            "status.unavailable",
+            "connection reset",
+            "connection refused",
+            "timed out",
+            "temporary failure in name resolution",
+        )
+    )
+
+
+def _v5_quota_backoff_schedule() -> list[float]:
+    """Seconds before each retry after a transient 429/network error. Shares the
+    GEMINI_QUOTA_RETRY_DELAYS override with the legacy generator (comma seconds;
+    "0"/"off"/"none" disables). Default = 6 retries spanning ~8 min, enough to
+    ride out the free-tier per-minute (RPM) limit while still surfacing a true
+    daily cap promptly."""
+    raw = (os.environ.get("GEMINI_QUOTA_RETRY_DELAYS", "") or "").strip()
+    if raw:
+        if raw.lower() in ("0", "off", "none", "false"):
+            return []
+        try:
+            vals = [max(0.0, float(x)) for x in raw.split(",") if x.strip()]
+            if vals:
+                return vals
+        except Exception:
+            pass
+    return [20.0, 45.0, 75.0, 120.0, 120.0, 120.0]
+
+
 def gemini_call(
     prompt: str,
     *,
@@ -274,17 +319,41 @@ def gemini_call(
     contents: list[Any] = [prompt]
     if image_bytes is not None:
         contents.append(t.Part.from_bytes(data=image_bytes, mime_type=image_mime))
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=t.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max(max_tokens * 2, 16384),
-            response_mime_type="application/json",
-            thinking_config=t.ThinkingConfig(thinking_budget=thinking_budget),
-        ),
-    )
-    return response.text or ""
+    # v5.7: ride out transient 429 / RESOURCE_EXHAUSTED + network blips so a
+    # rate limit doesn't silently drop a question or a whole generation stage.
+    # Mirrors the legacy generator's _raw_gemini_call backoff. Every v5 stage
+    # (kernel/stem/distractor/critic/regen/image/gate) routes through here, so
+    # one wrapper protects them all. Healthy calls add zero delay; only after
+    # the schedule is exhausted does the exception propagate to the caller.
+    delays = _v5_quota_backoff_schedule()
+    attempt = 0
+    while True:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=t.GenerateContentConfig(
+                    temperature=temperature,
+                    max_output_tokens=max(max_tokens * 2, 16384),
+                    response_mime_type="application/json",
+                    thinking_config=t.ThinkingConfig(thinking_budget=thinking_budget),
+                ),
+            )
+            return response.text or ""
+        except Exception as exc:
+            if _v5_is_transient_api_failure(exc) and attempt < len(delays):
+                base = delays[attempt]
+                delay = base + random.uniform(0.0, min(5.0, base * 0.2))
+                print(
+                    f"[v5-quota-backoff] transient API failure ({str(exc)[:80]}); "
+                    f"waiting {delay:.0f}s then retrying ({attempt + 1}/{len(delays)})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            raise
 
 
 def parse_json_loose(raw: str) -> dict | None:
@@ -302,6 +371,238 @@ def parse_json_loose(raw: str) -> dict | None:
         return json.loads(m.group(0))
     except json.JSONDecodeError:
         return None
+
+
+# ── Image relevance gate (ALL organic generators) ───────────────────────────
+#
+# Every organic generator (OME, Fast Facts, Emma, UWorld, Mehlman, Anki,
+# Divine) attaches figures through assemble_question -> build_v5_source_media
+# (Stage-8 SOURCE images) and build_v5_external_media (Stage-8c BORROWED
+# images). Neither attachment proves the figure matches THIS question: Stage-8
+# routing and the Stage-8c external fetch both pick on a best-effort query and
+# can staple a figure about a DIFFERENT topic (the Mehlman q011 case: a PDA
+# O2-saturation diagram landed on a tricuspid-regurgitation question).
+#
+# This gate runs a multimodal relevance check on every attached figure, at the
+# single shared chokepoint, so EVERY organic generator benefits — not just
+# Mehlman's own page-figure path. It mirrors the Mehlman gate's semantics
+# (vision Flash, thinking_budget=0, strict "when unsure, reject", fail-safe =
+# drop) but is built on v5's own gemini_call/parse_json_loose, so it carries no
+# cross-module dependency on the Mehlman file and no refactor of it.
+#
+# ON by default; set V5_IMAGE_RELEVANCE_GATE=0 to disable. Verdicts are cached
+# by (image bytes, question identity) and the cache is lock-guarded because
+# generate_v5 fans questions out across a ThreadPoolExecutor.
+
+_V5_IMAGE_GATE_ENV = "V5_IMAGE_RELEVANCE_GATE"
+_v5_image_gate_cache: dict[str, dict[str, Any]] = {}
+_v5_image_gate_lock = threading.Lock()
+
+
+def _v5_image_relevance_gate_enabled() -> bool:
+    """Gate is ON by default; set V5_IMAGE_RELEVANCE_GATE=0 to disable."""
+    return (os.environ.get(_V5_IMAGE_GATE_ENV, "1").strip() or "1").lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _v5_data_url_to_bytes(data_url: str) -> tuple[bytes | None, str]:
+    """Decode a ``data:<mime>;base64,<payload>`` URL to (bytes, mime).
+
+    Returns (None, "") for anything that is not a base64 data URL (a remote
+    http(s) URL, or a malformed string) so the caller degrades to "cannot
+    verify" rather than raising. Every v5 image entry carries a base64 data
+    URL (build_v5_source_media / build_v5_external_media both emit one), so the
+    None path is the rare can't-happen case — and the gate treats it as a drop.
+    """
+    m = re.match(r"data:([^;,]+)(;base64)?,(.*)$", data_url or "", re.DOTALL)
+    if not m or not m.group(2):  # no match, or not base64-encoded
+        return None, ""
+    mime = (m.group(1) or "image/png").strip() or "image/png"
+    try:
+        return base64.b64decode(m.group(3) or ""), mime
+    except Exception:
+        return None, ""
+
+
+def _v5_question_image_context(question: dict[str, Any]) -> dict[str, str]:
+    """Pull the text a relevance verdict needs out of an assembled question."""
+    stem = str(question.get("stem") or "").strip()
+    correct = str(question.get("correctAnswer") or "").strip()
+    correct_text = ""
+    for ch in (question.get("answerChoices") or []):
+        if isinstance(ch, dict) and str(ch.get("label") or "").strip() == correct:
+            correct_text = str(ch.get("text") or "").strip()
+            break
+    concept = str(
+        question.get("testedConcept")
+        or question.get("educationalObjective")
+        or question.get("retrievalTag")
+        or ""
+    ).strip()
+    return {"stem": stem, "correct": correct, "correct_text": correct_text, "concept": concept}
+
+
+def _v5_figure_relevance_verdict(
+    image_bytes: bytes, mime: str, ctx: dict[str, str]
+) -> dict[str, Any]:
+    """Decide whether ``image_bytes`` belongs on the question described by ctx.
+
+    Returns {'keep': bool, 'depicts': str, 'reason': str, 'status': str} where
+    status is 'relevant' | 'irrelevant' | 'gate_error'. Fail-safe: every
+    non-affirmative outcome (call error, empty/garbled response, parse failure)
+    yields keep=False so an UNVERIFIED image is never attached. Verdicts are
+    cached by (image bytes, question signature); the cache is lock-guarded for
+    the ThreadPoolExecutor fan-out in generate_v5.
+    """
+    stem = ctx.get("stem", "")
+    concept = ctx.get("concept", "")
+    sig = hashlib.md5(
+        (hashlib.md5(image_bytes).hexdigest() + "|" + stem[:160] + "|" + concept[:120]).encode("utf-8")
+    ).hexdigest()
+    with _v5_image_gate_lock:
+        cached = _v5_image_gate_cache.get(sig)
+    if cached is not None:
+        return cached
+
+    prompt = (
+        "You are a medical-education quality reviewer. A figure was "
+        "AUTOMATICALLY attached to a board-style question by an upstream "
+        "image-routing/sourcing step. Automatic attachment is NOT proof the "
+        "figure belongs to THIS question — the routing picks on a best-effort "
+        "query and can attach a figure about a DIFFERENT topic.\n\n"
+        "Decide whether the attached figure should appear with THIS question.\n\n"
+        f"QUESTION STEM:\n{stem}\n\n"
+        f"CORRECT ANSWER: {ctx.get('correct', '')} — {ctx.get('correct_text', '')}\n\n"
+        f"TESTED CONCEPT: {concept}\n\n"
+        "Look at the image. Keep it (relevant=true) ONLY if it directly "
+        "illustrates, depicts, or supports the specific concept this question "
+        "tests (the diagnosis, the mechanism, or a structure named in the "
+        "stem). Reject (relevant=false) if it is about a DIFFERENT topic — even "
+        "a related one (a different lesion, a different organ, an unrelated "
+        "diagram, or a logo/decorative graphic). When unsure, reject.\n\n"
+        "Respond with STRICT JSON only, no markdown fences:\n"
+        '{"depicts": "<short phrase: what the image actually shows>", '
+        '"relevant": true, "reason": "<one sentence>"}'
+    )
+
+    def _cache(verdict: dict[str, Any]) -> dict[str, Any]:
+        with _v5_image_gate_lock:
+            _v5_image_gate_cache[sig] = verdict
+        return verdict
+
+    try:
+        raw = gemini_call(
+            prompt,
+            model=IMAGE_MODEL,
+            max_tokens=1024,
+            temperature=0.0,
+            thinking_budget=0,
+            image_bytes=image_bytes,
+            image_mime=mime,
+        )
+    except Exception as exc:  # network, quota, SDK, auth — never raise into assembly
+        return _cache({"keep": False, "depicts": "", "status": "gate_error",
+                       "reason": f"vision gate call failed: {exc}"[:200]})
+
+    parsed = parse_json_loose(raw)
+    if not isinstance(parsed, dict) or "relevant" not in parsed:
+        return _cache({"keep": False, "depicts": "", "status": "gate_error",
+                       "reason": "vision verdict parse failed"})
+
+    keep = bool(parsed.get("relevant"))
+    return _cache({
+        "keep": keep,
+        "depicts": str(parsed.get("depicts") or "")[:160],
+        "reason": str(parsed.get("reason") or "")[:240],
+        "status": "relevant" if keep else "irrelevant",
+    })
+
+
+def _v5_gate_question_images(question: dict[str, Any]) -> dict[str, Any]:
+    """Drop any attached figure that fails the relevance gate, in-place.
+
+    Walks question['images'] (stem) and question['explanationImages']
+    (explanation), runs the multimodal verdict on each, keeps only relevant
+    figures, prunes the parallel figureRefs list, and recomputes
+    hasEmbeddedFigure. No-op when the gate is disabled or the question carries
+    no figures. Returns a small summary for the per-question debug trace/logs.
+
+    figureRefs is pruned positionally per location: build_v5_source_media and
+    build_v5_external_media append one image and one figureRef in lockstep, so
+    the k-th figureRef of a given location pairs with the k-th image of that
+    location. We keep a per-location keep-mask in original order and filter the
+    refs by it — robust even if a question ever carries more than one figure.
+    """
+    summary: dict[str, Any] = {"checked": 0, "kept": 0, "dropped": 0, "drops": []}
+    if not _v5_image_relevance_gate_enabled():
+        return summary
+    images = list(question.get("images") or [])
+    expl = list(question.get("explanationImages") or [])
+    if not images and not expl:
+        return summary
+
+    ctx = _v5_question_image_context(question)
+    keep_mask: dict[str, list[bool]] = {"stem": [], "explanation": []}
+
+    def _gate_list(entries: list[dict[str, Any]], location: str) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        for entry in entries:
+            data_url = entry.get("dataUrl") if isinstance(entry, dict) else None
+            img_bytes, mime = _v5_data_url_to_bytes(str(data_url or ""))
+            if img_bytes is None:
+                keep_it = False
+                verdict = {"status": "gate_error", "depicts": "",
+                           "reason": "image not a decodable base64 data URL"}
+            else:
+                summary["checked"] += 1
+                verdict = _v5_figure_relevance_verdict(img_bytes, mime, ctx)
+                keep_it = bool(verdict.get("keep"))
+            keep_mask[location].append(keep_it)
+            if keep_it:
+                summary["kept"] += 1
+                kept.append(entry)
+            else:
+                summary["dropped"] += 1
+                summary["drops"].append({
+                    "location": location,
+                    "status": verdict.get("status"),
+                    "depicts": verdict.get("depicts"),
+                    "reason": verdict.get("reason"),
+                    "source": (entry.get("source") if isinstance(entry, dict) else "") or "",
+                })
+                print(
+                    f"[v5-imggate] Q{question.get('questionNumber')} dropped {location} "
+                    f"figure ({verdict.get('status')}): depicts "
+                    f"{verdict.get('depicts')!r} — {verdict.get('reason')}",
+                    file=sys.stderr,
+                )
+        return kept
+
+    question["images"] = _gate_list(images, "stem")
+    question["explanationImages"] = _gate_list(expl, "explanation")
+
+    # Prune figureRefs positionally, by location, using the keep masks.
+    refs = question.get("figureRefs") or []
+    if refs:
+        cursor = {"stem": 0, "explanation": 0}
+        pruned: list[dict[str, Any]] = []
+        for ref in refs:
+            loc = str((ref.get("location") if isinstance(ref, dict) else "") or "").strip().lower()
+            mask = keep_mask.get(loc)
+            if mask is None:
+                pruned.append(ref)  # unknown location → leave as-is
+                continue
+            idx = cursor[loc]
+            cursor[loc] += 1
+            if idx >= len(mask) or mask[idx]:
+                pruned.append(ref)
+        question["figureRefs"] = pruned
+
+    question["hasEmbeddedFigure"] = bool(
+        question.get("images") or question.get("explanationImages")
+    )
+    return summary
 
 
 # ── Stage 1: PLAN ───────────────────────────────────────────────────────────
@@ -1278,6 +1579,13 @@ def generate_one_question(
         rng=rng,
     )
 
+    # Stage 9b: image relevance gate (ALL organic generators). Drop any
+    # attached figure that does not actually illustrate THIS question, so
+    # OME / Fast Facts / Emma / UWorld / Mehlman / Anki / Divine all benefit
+    # from the same check, not just Mehlman's page-figure path. Fail-safe =
+    # drop; ON by default (V5_IMAGE_RELEVANCE_GATE=0 disables).
+    image_gate_summary = _v5_gate_question_images(q)
+
     # Debug artifact
     try:
         (DEBUG_DIR / f"Q{question_number:04d}.json").write_text(
@@ -1290,6 +1598,7 @@ def generate_one_question(
                     "critic": critic,
                     "image_route": image_route,
                     "length_parity": parity_info,
+                    "image_gate": image_gate_summary,
                     "final": q,
                 },
                 indent=2,

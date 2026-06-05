@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import textwrap
@@ -558,6 +559,30 @@ def reset_quota_state() -> None:
     _QUOTA_EXHAUSTED = False
 
 
+def _quota_backoff_schedule() -> List[float]:
+    """Seconds to wait before each retry after a transient 429 / network error.
+
+    The schedule deliberately crosses the ~60s free-tier per-minute (RPM)
+    window so a transient rate limit resolves on its own instead of killing
+    the whole run. Override with GEMINI_QUOTA_RETRY_DELAYS (comma-separated
+    seconds, e.g. "30,60,90,120"); more entries = more patience before the run
+    gives up on a chunk. Set it to "0"/"off"/"none" to restore the old
+    fail-fast behavior. Default = 6 retries spanning ~8 minutes, enough to ride
+    out per-minute limits while still latching promptly on a true daily cap.
+    """
+    raw = (os.environ.get("GEMINI_QUOTA_RETRY_DELAYS", "") or "").strip()
+    if raw:
+        if raw.lower() in ("0", "off", "none", "false"):
+            return []
+        try:
+            vals = [max(0.0, float(x)) for x in raw.split(",") if x.strip()]
+            if vals:
+                return vals
+        except Exception:
+            pass
+    return [20.0, 45.0, 75.0, 120.0, 120.0, 120.0]
+
+
 # Bound on the per-chunk shortfall recovery loop in process_file(). The main
 # chunk loop produces some output; if a chunk returned fewer questions than
 # requested AND the quota latch isn't tripped, we make up to this many focused
@@ -843,38 +868,67 @@ def _raw_gemini_call(api_key: str, prompt: str) -> str:
     couldn't recover. Force-slice in split_into_chunks is the primary defense;
     this token bump is the secondary safety net. Same value on both backends.
     """
-    try:
-        client = _gemini_client()
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=_genai_types.GenerateContentConfig(
-                temperature=0.4,
-                # v4.79: Bumped from 16384 to 32768 to absorb thinking-token
-                # consumption alongside the actual output. Question-gen runs
-                # at ~12-15 questions per chunk on Anki .txt exports; with
-                # dynamic thinking enabled (typically 1-4K thinking tokens
-                # for question-gen tasks), we need ~28K headroom for the
-                # actual JSON output to land cleanly without truncation.
-                max_output_tokens=32768,
-                # v4.79: Dynamic thinking enabled (budget=-1 lets the model
-                # decide how much reasoning to do based on task complexity).
-                # User priority: quality > cost. The $300 Vertex Free Trial
-                # absorbs the higher per-call cost during validation.
-                # Earlier iteration had thinking_budget=0 to match pre-v4.79
-                # raw-HTTP behavior; flipped to -1 per explicit user request.
-                thinking_config=_genai_types.ThinkingConfig(thinking_budget=-1),
-            ),
-        )
-    except EnvironmentError:
-        # _gemini_client() raises EnvironmentError on misconfig — re-raise
-        # as-is so the operator sees the actionable message.
-        raise
-    except Exception as exc:
-        # Re-raise with a string format compatible with is_quota_failure /
-        # is_network_failure text matching downstream. Preserve the original
-        # exception via `from exc` for traceback fidelity.
-        raise ValueError(f"Gemini call failed: {exc}") from exc
+    # v4.81: ride out transient HTTP 429 / RESOURCE_EXHAUSTED and network blips
+    # instead of giving up on the first one. Free-tier Gemini enforces a
+    # per-MINUTE request ceiling that resets every ~60s; the old code treated
+    # the first 429 as terminal for the whole run (latched + skipped every
+    # remaining chunk), which is why a 944-chunk Anki deck produced only 44
+    # questions. We back off and retry the SAME call until the schedule is
+    # exhausted; only then does the exception propagate so the caller's quota
+    # latch trips (true daily-cap exhaustion). Healthy runs add zero delay.
+    delays = _quota_backoff_schedule()
+    attempt = 0
+    while True:
+        try:
+            client = _gemini_client()
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(
+                    temperature=0.4,
+                    # v4.79: Bumped from 16384 to 32768 to absorb thinking-token
+                    # consumption alongside the actual output. Question-gen runs
+                    # at ~12-15 questions per chunk on Anki .txt exports; with
+                    # dynamic thinking enabled (typically 1-4K thinking tokens
+                    # for question-gen tasks), we need ~28K headroom for the
+                    # actual JSON output to land cleanly without truncation.
+                    max_output_tokens=32768,
+                    # v4.79: Dynamic thinking enabled (budget=-1 lets the model
+                    # decide how much reasoning to do based on task complexity).
+                    # User priority: quality > cost. The $300 Vertex Free Trial
+                    # absorbs the higher per-call cost during validation.
+                    # Earlier iteration had thinking_budget=0 to match pre-v4.79
+                    # raw-HTTP behavior; flipped to -1 per explicit user request.
+                    thinking_config=_genai_types.ThinkingConfig(thinking_budget=-1),
+                ),
+            )
+            break
+        except EnvironmentError:
+            # _gemini_client() raises EnvironmentError on misconfig — re-raise
+            # as-is so the operator sees the actionable message.
+            raise
+        except Exception as exc:
+            # Transient quota (429) / network blip → wait and retry the SAME
+            # call. Only after the backoff schedule is exhausted do we re-raise
+            # in the is_quota_failure-compatible format so the caller latches.
+            transient = is_quota_failure(exc) or is_network_failure(exc)
+            if transient and attempt < len(delays):
+                base = delays[attempt]
+                delay = base + random.uniform(0.0, min(5.0, base * 0.2))
+                kind = "quota/429" if is_quota_failure(exc) else "network"
+                print(
+                    f"[quota-backoff] {kind} on Gemini call; waiting {delay:.0f}s "
+                    f"then retrying ({attempt + 1}/{len(delays)})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            # Re-raise with a string format compatible with is_quota_failure /
+            # is_network_failure text matching downstream. Preserve the original
+            # exception via `from exc` for traceback fidelity.
+            raise ValueError(f"Gemini call failed: {exc}") from exc
 
     text = getattr(response, "text", None)
     if not text:
@@ -1060,12 +1114,238 @@ def call_gemini_with_retry(
     return valid, warnings
 
 
+# ── Answer-position balancer (v6.0) ─────────────────────────────────────────────
+# Gemini emits answer choices as [correct, distractor, distractor, distractor],
+# so ~80% of organically generated questions have the correct answer at position
+# "A". This balances the correct-answer position across each file's questions
+# (≈25% A/B/C/D) and relabels any answer-choice letters embedded in the
+# explanation prose IN LOCKSTEP — using the exact boundary-anchored grammar that
+# was proven non-corrupting over all 942 questions of the existing "Peds Anki"
+# set (medical letter look-alikes like "Hemophilia A", "Vitamin C", "Group B
+# Strep", "E. coli" are never touched).
+#
+# Scope — runs ONLY for normal-mode organic questions that route through
+# build_app_ready_json (UWorld notes, Anki, OME, Divine, Mehlman). It is a no-op
+# for:
+#   • v5 questions  — they carry a "_v5_2" marker and are skipped per-question;
+#     the v5 pipeline's own distribution gate already balances them.
+#   • NBME / AMBOSS verbatim extraction — those never call build_app_ready_json.
+# Any question that cannot be PROVEN safe (positional verify + inverse round-trip)
+# is left EXACTLY as generated, so the worst case is a residual A-lean on a few
+# questions, never a corrupted letter reference.
+ANSWER_BALANCE_ENABLED = True            # master switch — set False to disable
+_BAL_SEED_BASE = 0x5A1AD                  # deterministic per-file seed base
+_BAL_LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+_BAL_LETTERRUN = r'[A-E](?:\s*(?:,\s*and\s+|,\s*|\s+and\s+)[A-E])*'
+_BAL_LETTERRUN_OR = r'[A-E](?:\s*(?:,\s*and\s+|,\s*or\s+|,\s*|\s+and\s+|\s+or\s+)[A-E])+'
+_BAL_WORD = re.compile(r'\b(?:choices?|options?|answers?)(?:\s+choices?)?\s+(' + _BAL_LETTERRUN + r')', re.IGNORECASE)
+_BAL_PAREN = re.compile(r'\(([A-E])\)')
+_BAL_PRUN = re.compile(r'\((' + _BAL_LETTERRUN_OR + r')\)')
+_BAL_MED_BEFORE = re.compile(r'(?:hemophilia|hepatitis|vitamins?)\s*$', re.I)
+_BAL_BREF = re.compile(
+    r'(?:^|>|\n[ \t]*|[.;:]\s+)(' + _BAL_LETTERRUN + r')'
+    r'(?=\)\s|:\s|\.\s[A-Z0-9"\']|\s+(?:is|are|represent|represents|describe|describes|'
+    r'do|does|omit|omits|incorrectly|correctly)\b)')
+
+
+def _bal_stable_seed(s: str) -> int:
+    """FNV-1a — a stable, import-free hash so balancing is reproducible per file."""
+    h = 2166136261
+    for ch in (s or "").encode("utf-8"):
+        h = ((h ^ ch) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _bal_choice_ref_positions(text):
+    """Set of string indices whose char is a genuine choice-reference letter."""
+    if not text:
+        return set()
+    P = set()
+    for m in _BAL_PAREN.finditer(text):
+        P.add(m.start(1))
+    for m in _BAL_WORD.finditer(text):
+        run, base = m.group(1), m.start(1)
+        for mm in re.finditer(r'[A-E]', run):
+            P.add(base + mm.start())
+    for m in _BAL_BREF.finditer(text):
+        run, base = m.group(1), m.start(1)
+        for mm in re.finditer(r'[A-E]', run):
+            P.add(base + mm.start())
+    for m in _BAL_PRUN.finditer(text):
+        if _BAL_MED_BEFORE.search(text[:m.start()]):
+            continue  # medical subtype list, e.g. "Hemophilia (A, B, C)"
+        run, base = m.group(1), m.start(1)
+        for mm in re.finditer(r'[A-E]', run):
+            P.add(base + mm.start())
+    return P
+
+
+def _bal_relabel(text, M):
+    if not text:
+        return text
+    pos = _bal_choice_ref_positions(text)
+    if not pos:
+        return text
+    chars = list(text)
+    for i in pos:
+        chars[i] = M.get(chars[i], chars[i])
+    return ''.join(chars)
+
+
+def _bal_verify(old, new, M):
+    """Length preserved + every ref letter remapped + every other char identical.
+    Exact because all swaps are single-char."""
+    if old is None and new is None:
+        return True
+    old = old or ""
+    new = new or ""
+    if len(old) != len(new):
+        return False
+    pos = _bal_choice_ref_positions(old)
+    for i in range(len(old)):
+        exp = M.get(old[i], old[i]) if i in pos else old[i]
+        if new[i] != exp:
+            return False
+    return True
+
+
+def _bal_text_blocks(q):
+    """(key, original_text) for every relabelable explanation field of a
+    GENERATED question. Stem and answer-choice texts are intentionally excluded —
+    they do not reference other choices by letter."""
+    blocks = []
+    for f in ('educationalObjective', 'reviewPearl', 'clinicalPearl'):
+        if isinstance(q.get(f), str):
+            blocks.append((f, q[f]))
+    for si, sec in enumerate(q.get('explanationSections') or []):
+        body = sec.get('body')
+        if isinstance(body, list):
+            for bi, b in enumerate(body):
+                if isinstance(b, str):
+                    blocks.append((('ES', si, bi), b))
+    return blocks
+
+
+def _bal_eligible(q):
+    """Only a clean 2+-choice MCQ with unique choice texts and a valid correct
+    label can be safely text-mapped. v5 questions are excluded by their marker."""
+    if not isinstance(q, dict) or q.get('_v5_2') is not None:
+        return False
+    choices = q.get('answerChoices')
+    if not isinstance(choices, list) or len(choices) < 2:
+        return False
+    labels = [c.get('label') for c in choices if isinstance(c, dict)]
+    texts = [c.get('text') for c in choices if isinstance(c, dict)]
+    if len(labels) != len(choices) or len(texts) != len(choices):
+        return False
+    if any(not isinstance(l, str) or not l for l in labels):
+        return False
+    if any(not isinstance(t, str) for t in texts):
+        return False
+    if len(set(texts)) != len(texts):
+        return False  # duplicate choice text -> cannot map old->new label by text
+    return q.get('correctAnswer') in labels
+
+
+def _bal_apply_one(q, target_pos, qseed):
+    """Mutate q in place and return True IFF the shuffle is proven safe; else
+    leave q exactly as-is and return False."""
+    choices = q['answerChoices']
+    n = len(choices)
+    by_label = {c['label']: c['text'] for c in choices}
+    correct_old = q['correctAnswer']
+    correct_text = by_label[correct_old]
+    distractors = [c['text'] for c in choices if c['label'] != correct_old]
+    random.Random(qseed).shuffle(distractors)
+    tpos = target_pos % n
+    arrangement = [None] * n
+    arrangement[tpos] = correct_text
+    di = 0
+    for p in range(n):
+        if p == tpos:
+            continue
+        arrangement[p] = distractors[di]
+        di += 1
+    new_labels = _BAL_LABELS[:n]
+    text_to_new = {arrangement[p]: new_labels[p] for p in range(n)}
+    M = {c['label']: text_to_new[c['text']] for c in choices}   # old label -> new label
+    Minv = {v: k for k, v in M.items()}
+
+    # Relabel every explanation field; PROVE each with positional verify + an
+    # inverse round-trip before committing anything.
+    new_vals = []
+    for key, old_text in _bal_text_blocks(q):
+        new_text = _bal_relabel(old_text, M)
+        if not _bal_verify(old_text, new_text, M):
+            return False
+        if _bal_relabel(new_text, Minv) != old_text:
+            return False
+        new_vals.append((key, new_text))
+
+    q['answerChoices'] = [{'label': new_labels[p], 'text': arrangement[p]} for p in range(n)]
+    q['correctAnswer'] = new_labels[tpos]
+    for key, new_text in new_vals:
+        if isinstance(key, tuple) and key[0] == 'ES':
+            _, si, bi = key
+            q['explanationSections'][si]['body'][bi] = new_text
+        else:
+            q[key] = new_text
+    return True
+
+
+def balance_answer_positions(questions, source_stem=""):
+    """Balance correct-answer position across a file's eligible questions and
+    relabel embedded choice-letter references in lockstep. Mutates `questions`
+    in place; returns a stats dict. No-op for v5 / non-MCQ / unprovable items."""
+    stats = {"balanced": 0, "skipped_v5": 0, "ineligible": 0, "unprovable": 0}
+    if not ANSWER_BALANCE_ENABLED or not isinstance(questions, list):
+        return stats
+    eligible = []
+    for i, q in enumerate(questions):
+        if isinstance(q, dict) and q.get('_v5_2') is not None:
+            stats["skipped_v5"] += 1
+        elif _bal_eligible(q):
+            eligible.append(i)
+        else:
+            stats["ineligible"] += 1
+    base_seed = _BAL_SEED_BASE ^ _bal_stable_seed(source_stem)
+    rng = random.Random(base_seed)
+    by_n = {}
+    for i in eligible:
+        by_n.setdefault(len(questions[i]['answerChoices']), []).append(i)
+    target = {}
+    for nopt, idxs in by_n.items():
+        seq = [k % nopt for k in range(len(idxs))]
+        rng.shuffle(seq)
+        for i, pos in zip(idxs, seq):
+            target[i] = pos
+    for i in eligible:
+        if _bal_apply_one(questions[i], target[i], base_seed * 131 + i):
+            stats["balanced"] += 1
+        else:
+            stats["unprovable"] += 1
+    return stats
+
+
 # ── App-ready wrapper ──────────────────────────────────────────────────────────
 def build_app_ready_json(
     source_stem: str,
     questions: List[Dict],
     warnings: List[str],
 ) -> Dict:
+    # v6.0: de-bias correct-answer position for normal-mode organic questions.
+    # No-op for v5 (per-question "_v5_2" skip) and verbatim (never reaches here).
+    # Mutates `questions` in place; summary goes to the console log, NOT to
+    # extractionWarnings (which would surface as a warning in the import dialog).
+    try:
+        _bal = balance_answer_positions(questions, source_stem)
+        if _bal["balanced"] or _bal["unprovable"]:
+            log(f"  answer-balance: shuffled {_bal['balanced']}, "
+                f"kept-as-is {_bal['unprovable']} (unprovable), "
+                f"v5-skipped {_bal['skipped_v5']}, non-MCQ {_bal['ineligible']}")
+    except Exception as exc:  # never let balancing break generation
+        warn(f"answer-balance skipped (internal error: {exc}); questions unchanged")
     return {
         "schemaVersion": "nbme-gemini-json-v3",
         "testTitle": source_stem,
@@ -1096,6 +1376,39 @@ def write_report(data: Dict, prefix: str = "question_generation_report") -> Path
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
+def _emit_bic_progress(**payload) -> None:
+    """Emit one ``BIC_PROGRESS {json}`` line for the Batch Import Center's
+    live progress bar (percentage + ETA).
+
+    Mirrors ``v5_pipeline._emit_bic_progress`` EXACTLY — same ``BIC_PROGRESS ``
+    prefix, same ``BIC_PROGRESS_SOURCE`` gate, same never-raise wrapper — so the
+    renderer's ``_flwExtractProgress`` consumes ``question`` / ``questionTotal``
+    identically whether a run took the v5 organic path or this legacy
+    uworld-family path.
+
+    THIS is the fix for the default (non-v5) Anki / OME / Divine / UWorld runs:
+    they call ``process_file`` below, which previously emitted only
+    human-readable ``Chunk N/M`` logs and NO per-question telemetry. The
+    profile runners faithfully forward ``BIC_PROGRESS`` lines, but the legacy
+    child never produced any — so the BIC bar sat at "Chunk progress not ready"
+    and only the 60s "still running" heartbeat ever moved.
+
+    No-op unless ``BIC_PROGRESS_SOURCE`` is set (electron/main.js sets it per
+    BIC run; the profile runners also default it to the sourceType), so a
+    standalone CLI run of this module prints nothing extra.
+    """
+    source = str(os.environ.get("BIC_PROGRESS_SOURCE") or "").strip()
+    if not source:
+        return
+    try:
+        print(
+            "BIC_PROGRESS " + json.dumps({"source": source, **payload}, ensure_ascii=False),
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def process_file(
     filepath: Path,
     questions_per_file: int,
@@ -1125,6 +1438,16 @@ def process_file(
         encoding="utf-8",
     )
     log(f"  {len(chunks)} chunk(s) → {chunk_path.name}")
+
+    # v5.12.3: BIC progress denominator. The legacy chunker floors at >=1
+    # question PER CHUNK (questions_per_chunk = max(1, qpf // n_chunks)), so a
+    # small questions_per_file target (e.g. 15) on a large note (e.g. 944
+    # chunks) actually yields ~944 questions. Using questions_per_file as the
+    # bar denominator pinned it at 15/15 = 100% while generation kept going.
+    # The real expected total == the sum of per-chunk requests, which works out
+    # to exactly max(questions_per_file, len(chunks)). Defined at function scope
+    # so the final "writing" emit (outside the live branch) can reuse it.
+    expected_total = max(int(questions_per_file), len(chunks))
 
     file_warnings: List[str] = []
     all_questions: List[Dict] = []
@@ -1158,6 +1481,18 @@ def process_file(
         remainder   = questions_per_file - questions_per_chunk * len(chunks)
         q_offset    = 0
         raw_generated: List[Dict] = []
+        # v5.12.2/.3: live BIC progress for the LEGACY path. expected_total is
+        # the true denominator (computed above); question= cumulative produced.
+        # Emitted once up front then after every chunk so the bar moves in real
+        # time instead of sitting at "Chunk progress not ready" OR freezing at
+        # 100% when the per-chunk floor overshoots questions_per_file.
+        _emit_bic_progress(
+            phase="generating",
+            message=f"Starting generation: 0 of {expected_total} question(s)",
+            question=0,
+            questionTotal=expected_total,
+            chunkTotal=len(chunks),
+        )
 
         for ci, chunk in enumerate(chunks):
             n = questions_per_chunk + (1 if ci < remainder else 0)
@@ -1198,6 +1533,14 @@ def process_file(
                 c_stat["error"]  = str(exc)
 
             chunk_stats.append(c_stat)
+            _emit_bic_progress(
+                phase="generating",
+                message=f"Generated {len(all_questions)} of {expected_total} question(s)",
+                question=len(all_questions),
+                questionTotal=expected_total,
+                chunk=ci + 1,
+                chunkTotal=len(chunks),
+            )
 
         # Per-chunk shortfall recovery (v4.54) — port of the v4.49 lecture-slide
         # missing-question recovery to the UWorld family. For each chunk that
@@ -1274,6 +1617,12 @@ def process_file(
 
     # 4. Build and write app-ready JSON (clean + repair-succeeded questions only;
     # failed-repair questions are surfaced via the review draft below).
+    _emit_bic_progress(
+        phase="writing",
+        message=f"Finalizing {len(all_questions)} question(s)",
+        question=len(all_questions),
+        questionTotal=expected_total,
+    )
     app_json = build_app_ready_json(stem, all_questions, file_warnings)
     app_path = APP_DIR / f"{stem}_app_ready.json"
     app_path.write_text(json.dumps(app_json, indent=2), encoding="utf-8")
