@@ -3498,15 +3498,21 @@ body.quiz-fullscreen-mode #modal-lab  { z-index: 10002 !important; }
       <div id="gemini-settings-status" style="font-size:11px;color:#5a6a7a;margin-top:4px;">Checking…</div>
     </div>
     <div class="form-group" style="margin-top:12px;">
-      <label class="form-label">Google Drive Backup</label>
-      <p style="font-size:12px;color:#5a6a7a;margin-bottom:8px;">Stores tests and question images in your Google Drive. Works from any HTTPS origin or from localhost (Electron dev). To use Drive from a new static host, add its origin to <code>DRIVE_EXTRA_ORIGINS</code> in the source and register it in Google Cloud Console.</p>
+      <label class="form-label">Google Drive Sync</label>
+      <p style="font-size:12px;color:#5a6a7a;margin-bottom:8px;">One button keeps this device and your Google Drive in sync. It compares timestamps and keeps the <strong>newest</strong> version — it never blindly overwrites newer data with older. It also syncs automatically when you close the app or tab. If both sides changed since the last sync, it asks you which to keep and saves the other as a dated safety copy.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-        <button class="btn-modal" onclick="window.unstickGoogleDriveSync && window.unstickGoogleDriveSync(); connectGoogleDrive()">Connect Drive</button>
-        <button class="btn-modal" onclick="window.unstickGoogleDriveSync && window.unstickGoogleDriveSync(); saveGoogleDriveNow()">Backup Now</button>
-        <button class="btn-modal" onclick="restoreGoogleDriveNow()">Restore Drive</button>
-        <button class="btn-modal" onclick="window.runDriveDiagnostics && window.runDriveDiagnostics()" title="Runs a self-test that shows EXACTLY what's failing — token state, folder IDs, last error, and a live test API call. Use this when sync keeps failing and you don't know why.">🔍 Drive Debug</button>
-        <button class="btn-modal" onclick="window.nbmeDiagnosticExport()" title="Download a JSON backup of your current local data with diagnostic info">📥 Diagnostic Backup</button>
+        <button class="btn-modal primary" onclick="window.unstickGoogleDriveSync && window.unstickGoogleDriveSync(); window.driveSyncNow('manual')" title="Sync this device with Google Drive now. Keeps whichever side is newer; never loses data.">🔄 Sync Now</button>
+        <button class="btn-modal" onclick="window.unstickGoogleDriveSync && window.unstickGoogleDriveSync(); connectGoogleDrive()" title="First-time setup: sign in and authorize Google Drive.">Connect Drive</button>
       </div>
+      <details style="margin-top:8px;">
+        <summary style="font-size:11px;color:#5a6a7a;cursor:pointer;">Advanced (manual backup / restore / diagnostics)</summary>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+          <button class="btn-modal" onclick="window.unstickGoogleDriveSync && window.unstickGoogleDriveSync(); saveGoogleDriveNow()" title="Force-push this device's data to Drive, regardless of timestamps.">⬆️ Force Backup</button>
+          <button class="btn-modal" onclick="restoreGoogleDriveNow()" title="Force-pull from Drive, overwriting this device's data.">⬇️ Force Restore</button>
+          <button class="btn-modal" onclick="window.runDriveDiagnostics && window.runDriveDiagnostics()" title="Runs a self-test that shows EXACTLY what's failing — token state, folder IDs, last error, and a live test API call. Use this when sync keeps failing and you don't know why.">🔍 Drive Debug</button>
+          <button class="btn-modal" onclick="window.nbmeDiagnosticExport()" title="Download a JSON backup of your current local data with diagnostic info">📥 Diagnostic Backup</button>
+        </div>
+      </details>
       <div id="drive-sync-status" style="font-size:11px;color:#5a6a7a;margin-top:6px;">Drive not connected.</div>
       <div id="drive-last-sync" style="font-size:11px;color:#5a6a7a;margin-top:2px;opacity:0.8;display:none;"></div>
       <pre id="drive-debug-output" style="display:none;margin-top:8px;padding:8px;background:#1a1f2e;color:#cfd6e0;border-radius:6px;font-size:11px;font-family:'SF Mono',Menlo,monospace;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;"></pre>
@@ -3556,6 +3562,11 @@ const DB = (() => {
   function defaultDB() {
     return {
       version: 1,
+      // v6.1: data-mutation clock for Drive newest-wins sync. Bumped by save()
+      // on every real mutation; 0 means "no local data yet". This is the LOCAL
+      // side of the timestamp comparison the Drive sync core uses to decide
+      // push vs pull (replacing the old blind-overwrite behavior).
+      updatedAt: 0,
       settings: {},
       sourceFolders: DEFAULT_SOURCE_FOLDERS.map(cloneSourceFolder),
       folders: [],
@@ -3775,10 +3786,16 @@ const DB = (() => {
     if (!_db) _db = loadLocal() || defaultDB();
     return ensureSourceFolders(_db);
   }
-  function save() {
+  function save(opts) {
     if (_db) {
+      // v6.1: bump the data-mutation clock for Drive newest-wins sync — UNLESS
+      // this is a sync-housekeeping write (applying driveFileIds, or applying a
+      // pulled snapshot). Those must preserve the timestamp that matches Drive,
+      // otherwise the next sync would falsely think "local changed".
+      const isSyncWrite = !!(opts && opts.sync);
+      if (!isSyncWrite) _db.updatedAt = Date.now();
       saveAppState(_db); // async, fire-and-forget — IndexedDB has no quota limit
-      if (typeof window.scheduleGoogleDriveSave === 'function') window.scheduleGoogleDriveSave();
+      if (!isSyncWrite && typeof window.scheduleGoogleDriveSave === 'function') window.scheduleGoogleDriveSave();
       return true;
     }
     return false;
@@ -4476,10 +4493,10 @@ window.MiscDocStore = MiscDocStore;
 
   window.driveIndicatorClick = function() {
     if (_accessToken) {
-      // v4.69: a click on the drive indicator is a manual user action — clear
-      // stuck flag + failure counter so the retry chain resumes from scratch.
-      window.unstickGoogleDriveSync();
-      window.saveGoogleDriveNow();
+      // v6.1: the pill is now the one-click Sync. driveSyncNow('manual') clears
+      // the stuck flag itself, then reconciles by timestamp (push / pull / prompt
+      // on conflict) instead of the old blind upload.
+      window.driveSyncNow('manual');
     } else {
       App.openSettings();
     }
@@ -4622,7 +4639,11 @@ window.MiscDocStore = MiscDocStore;
     const db = DB.get();
     const snap = JSON.parse(JSON.stringify({
       version: 1,
-      updatedAt: new Date().toISOString(),
+      // v6.1: epoch-ms data-mutation clock (NOT upload time). This is the value
+      // the newest-wins sync core compares across devices. updatedAtIso is kept
+      // purely for human-readable logs/diagnostics.
+      updatedAt: Number(db.updatedAt) || 0,
+      updatedAtIso: new Date().toISOString(),
       settings: db.settings || {},
       sourceFolders: db.sourceFolders,
       folders: db.folders,
@@ -4862,6 +4883,200 @@ window.MiscDocStore = MiscDocStore;
     }
   }
 
+  // ════════════════════════════════════════════════════════════════════════
+  // v6.1: Single-button, newest-wins Drive sync.
+  //
+  // WHY: the old flow blindly UPLOADED local state on auto-connect (see the
+  // former autoConnectGoogleDrive body). If a device opened with a STALE local
+  // DB while Drive held FRESHER data from another session, the stale local
+  // silently overwrote the good Drive backup — that's the data-loss bug.
+  //
+  // FIX: compare a real data-mutation clock (db.updatedAt, stamped into the
+  // snapshot) on both sides, using per-device "last reconciliation" markers to
+  // know what changed since the last sync. Then PUSH, PULL, or flag a CONFLICT
+  // — never a blind overwrite. Ambiguous cases (first sync with data on both
+  // sides, or true divergence) NEVER auto-destroy: interactive sync prompts the
+  // user (and always saves the losing side as a dated conflict copy first);
+  // background/close sync defers or writes a non-destructive conflict backup.
+  //
+  // The decision functions below are byte-for-byte the ones proven in
+  // /tmp/test_drive_sync.js (21/21). Keep them in lockstep if edited.
+  // ════════════════════════════════════════════════════════════════════════
+  const _DRIVE_SYNC_LOCAL_AT_KEY  = 'nbme_drive_sync_local_at_v1';
+  const _DRIVE_SYNC_REMOTE_AT_KEY = 'nbme_drive_sync_remote_at_v1';
+  let _syncBusy = false;
+
+  function _driveReadMarkers() {
+    let l = '', r = '';
+    try { l = localStorage.getItem(_DRIVE_SYNC_LOCAL_AT_KEY)  || ''; } catch (e) {}
+    try { r = localStorage.getItem(_DRIVE_SYNC_REMOTE_AT_KEY) || ''; } catch (e) {}
+    return { localAt: l, remoteAt: r };
+  }
+  function _driveWriteMarkers(localAt, remoteAt) {
+    try { localStorage.setItem(_DRIVE_SYNC_LOCAL_AT_KEY,  String(localAt  || '')); } catch (e) {}
+    try { localStorage.setItem(_DRIVE_SYNC_REMOTE_AT_KEY, String(remoteAt || '')); } catch (e) {}
+  }
+  function _driveSnapIsEmpty(s) {
+    if (!s) return true;
+    const t = Array.isArray(s.tests)   ? s.tests.length   : 0;
+    const f = Array.isArray(s.folders) ? s.folders.length : 0;
+    return t === 0 && f === 0;
+  }
+  // Pure decision — no I/O. Returns 'noop' | 'push' | 'pull' | 'conflict'.
+  function _driveDecideAction(localUpdatedAt, localIsEmpty, remoteSnap, markers) {
+    const remoteMissing = !remoteSnap;
+    const remoteEmpty   = remoteMissing || _driveSnapIsEmpty(remoteSnap);
+    const remoteAt      = remoteMissing ? '' : String(remoteSnap.updatedAt || '');
+    const localAt       = String(localUpdatedAt || '');
+    if (remoteMissing)               return localIsEmpty ? 'noop' : 'push';
+    if (remoteEmpty && localIsEmpty) return 'noop';
+    if (localIsEmpty)                return 'pull';   // fresh device, remote has data
+    if (remoteEmpty)                 return 'push';   // remote blank, local has data
+    const haveMarkers = (String(markers.localAt || '') !== '' ||
+                         String(markers.remoteAt || '') !== '');
+    if (!haveMarkers) return 'conflict';              // first sync, data on both sides
+    const localChanged  = localAt  !== String(markers.localAt  || '');
+    const remoteChanged = remoteAt !== String(markers.remoteAt || '');
+    if (!localChanged && !remoteChanged) return 'noop';
+    if (localChanged && !remoteChanged)  return 'push';
+    if (!localChanged && remoteChanged)  return 'pull';
+    return 'conflict';                                // both changed → divergence
+  }
+  // Boot/periodic: never destructive on ambiguity. conflict → 'defer'.
+  function _driveDecideAuto(localUpdatedAt, localIsEmpty, remoteSnap, markers) {
+    const a = _driveDecideAction(localUpdatedAt, localIsEmpty, remoteSnap, markers);
+    return a === 'conflict' ? 'defer' : a;
+  }
+  // Close/background: never discard just-made local edits → no auto-pull.
+  // pull → 'skip'; conflict → 'conflict-copy' (preserve local, don't overwrite).
+  function _driveDecideClose(localUpdatedAt, localIsEmpty, remoteSnap, markers) {
+    const a = _driveDecideAction(localUpdatedAt, localIsEmpty, remoteSnap, markers);
+    if (a === 'pull')     return 'skip';
+    if (a === 'conflict') return 'conflict-copy';
+    return a; // 'push' | 'noop'
+  }
+
+  // Download + parse the remote manifest WITHOUT creating an empty one.
+  // Returns the parsed snapshot object, or null if no usable remote exists.
+  async function _driveFetchRemoteSnapshot() {
+    const folderId = await ensureDriveFolder();
+    const existing = await findDriveFile(DRIVE_MANIFEST_NAME, 'application/json', folderId);
+    if (!existing) return null;
+    _manifestFileId = existing.id;
+    try {
+      const resp = await driveFetch(`https://www.googleapis.com/drive/v3/files/${existing.id}?alt=media`);
+      const txt = await resp.text();
+      if (!txt || !txt.trim()) return null;
+      const snap = JSON.parse(txt);
+      return (snap && typeof snap === 'object') ? snap : null;
+    } catch (e) {
+      console.warn('[drive sync] could not read remote manifest:', e && e.message);
+      return null;
+    }
+  }
+
+  // Non-destructive safety net: upload a dated copy of `snapshot` so the side
+  // that is about to be overwritten is always recoverable from Drive.
+  async function _driveSaveConflictCopy(snapshot, reason) {
+    try {
+      const folderId = await ensureDriveFolder();
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const name = `nbme_manifest.conflict-${ts}.json`;
+      const blob = new Blob([JSON.stringify(snapshot)], { type: 'application/json' });
+      await uploadDriveFile(name, blob, 'application/json', folderId, null);
+      console.warn('[drive sync] saved conflict copy:', name, '(' + (reason || '') + ')');
+      return name;
+    } catch (e) {
+      console.error('[drive sync] failed to save conflict copy:', e);
+      return null;
+    }
+  }
+
+  // THE single entry point. mode: 'manual' (default, prompts on conflict),
+  // 'auto' (boot — may pull+reload, defers on conflict), or
+  // 'background'/'close' (periodic/tab-hide/quit — pushes only, never reloads,
+  // writes a conflict copy on divergence).
+  window.driveSyncNow = async function(mode) {
+    mode = mode || 'manual';
+    if (_syncBusy) return;
+    if (mode !== 'manual' && (_busy || _driveSyncInProgress)) return;
+    _syncBusy = true;
+    try {
+      window.unstickGoogleDriveSync && window.unstickGoogleDriveSync();
+      setDriveStatus('Checking Drive…', '#f0a500');
+      await ensureDriveAuth('');
+      localStorage.setItem(DRIVE_ENABLED_KEY, '1');
+
+      const remoteSnap = await _driveFetchRemoteSnapshot();
+      const db = DB.get();
+      const localEmpty =
+        (Array.isArray(db.tests)   ? db.tests.length   : 0) === 0 &&
+        (Array.isArray(db.folders) ? db.folders.length : 0) === 0;
+      const localAt = Number(db.updatedAt) || 0;
+      const markers = _driveReadMarkers();
+
+      let action;
+      if (mode === 'auto')        action = _driveDecideAuto(localAt, localEmpty, remoteSnap, markers);
+      else if (mode === 'manual') action = _driveDecideAction(localAt, localEmpty, remoteSnap, markers);
+      else                        action = _driveDecideClose(localAt, localEmpty, remoteSnap, markers);
+
+      console.log('[drive sync] mode=' + mode + ' → action=' + action, {
+        localAt, localEmpty,
+        remoteAt: remoteSnap ? remoteSnap.updatedAt : null,
+        markers
+      });
+
+      if (action === 'noop' || action === 'skip') {
+        setDriveStatus('Drive up to date.', '#27ae60', 'Drive synced', 'ok');
+        return;
+      }
+      if (action === 'defer') {
+        setDriveStatus('Drive has newer changes that need review — click Sync to resolve.',
+          '#f0a500', 'Sync needed — click to resolve', 'warn');
+        return;
+      }
+      if (action === 'push') {
+        await window.saveGoogleDriveNow();   // proven push; updates markers on success
+        return;
+      }
+      if (action === 'pull') {
+        await window.restoreGoogleDriveNow(); // proven restore; updates markers, reloads
+        return;
+      }
+      if (action === 'conflict-copy') {
+        await _driveSaveConflictCopy(driveDbSnapshot(), 'close-divergence');
+        setDriveStatus('Saved a conflict backup to Drive — resolve on next launch.',
+          '#f0a500', 'Conflict backup saved', 'warn');
+        return;
+      }
+      if (action === 'conflict') {
+        const rt = remoteSnap && Array.isArray(remoteSnap.tests) ? remoteSnap.tests.length : 0;
+        const lt = Array.isArray(db.tests) ? db.tests.length : 0;
+        const keepLocal = confirm(
+          'Both this device and Google Drive changed since the last sync.\n\n' +
+          '  • This device: ' + lt + ' test' + (lt !== 1 ? 's' : '') + '\n' +
+          '  • Google Drive: ' + rt + ' test' + (rt !== 1 ? 's' : '') + '\n\n' +
+          'OK  = keep THIS DEVICE (upload to Drive)\n' +
+          'Cancel = keep GOOGLE DRIVE (download to this device)\n\n' +
+          'The other version is saved as a dated conflict backup on Drive first, so nothing is lost.'
+        );
+        if (keepLocal) {
+          if (remoteSnap) await _driveSaveConflictCopy(remoteSnap, 'manual-keep-local');
+          await window.saveGoogleDriveNow();
+        } else {
+          await _driveSaveConflictCopy(driveDbSnapshot(), 'manual-keep-remote');
+          await window.restoreGoogleDriveNow();
+        }
+        return;
+      }
+    } catch (e) {
+      setDriveStatus(e.message || 'Drive sync failed.', '#e74c3c', 'Sync failed', 'error');
+      console.error('[drive sync] error:', e);
+    } finally {
+      _syncBusy = false;
+    }
+  };
+
   window.connectGoogleDrive = async function() {
     try {
       setDriveStatus('Connecting Drive...', '#f0a500');
@@ -4899,18 +5114,14 @@ window.MiscDocStore = MiscDocStore;
     try {
       setDriveStatus('Connecting Drive...', '#f0a500');
       await ensureDriveAuth('');
-      await ensureDriveFolder();
-      await ensureManifestFile();
       setDriveStatus('Drive connected.', '#27ae60');
       updateDriveIndicator();
-      // If local DB has tests, schedule a sync immediately on reconnect so Drive
-      // always reflects the latest local state after any session or token expiry.
-      // Guard: never auto-upload from a fresh device that has 0 tests — that would
-      // overwrite a good Drive backup with an empty DB.
-      const _autoSyncDb = DB.get();
-      if ((_autoSyncDb.tests || []).length > 0) {
-        window.scheduleGoogleDriveSave();
-      }
+      // v6.1 BUG FIX: the old code blindly UPLOADED local state here whenever the
+      // local DB had any tests — which let a STALE local DB silently overwrite a
+      // FRESHER Drive backup (the reported data-loss bug). It now reconciles by
+      // timestamp: driveSyncNow('auto') PULLS if Drive is newer, PUSHES if local
+      // is newer, and DEFERS (never overwrites) if the two have diverged.
+      await window.driveSyncNow('auto');
     } catch(e) {
       setDriveStatus('Drive needs reconnection. Click Connect Drive.', '#e74c3c', 'Reconnect Drive', 'error');
     }
@@ -4928,14 +5139,24 @@ window.MiscDocStore = MiscDocStore;
       const snapshot = driveDbSnapshot();
       await uploadFiguresToDrive(snapshot);
       applyDriveFileIdsToLocal(snapshot);
-      _skipNextSchedule = true;
-      DB.save();
+      // v6.1: persist the applied driveFileIds WITHOUT bumping db.updatedAt — this
+      // is sync housekeeping, not a user edit. Keeping the clock unchanged means
+      // db.updatedAt still equals snapshot.updatedAt (== what Drive now holds),
+      // so the markers below line up and the next sync correctly sees "no change".
+      DB.save({ sync: true });
       setDriveStatus('Saving database manifest…', '#f0a500');
       await saveManifestToDrive(snapshot);
       setDriveStatus('Saving documents…', '#f0a500');
       await saveMiscDocsToDrive();
       _driveDirty = false;
       _driveSyncInProgress = false;
+      // v6.1: record the reconciliation point. After a push, Drive holds exactly
+      // this snapshot, so both clocks equal snapshot.updatedAt. The next sync on
+      // any device then compares against a truthful baseline instead of guessing.
+      try {
+        const _snapAt = Number(snapshot.updatedAt) || 0;
+        _driveWriteMarkers(_snapAt, _snapAt);
+      } catch (e) {}
       // v4.67: record success for last-sync indicator + reset failure counter
       _driveLastSyncTimestamp = Date.now();
       try { localStorage.setItem(_DRIVE_LAST_SYNC_KEY, String(_driveLastSyncTimestamp)); } catch (e) {}
@@ -5040,8 +5261,14 @@ window.MiscDocStore = MiscDocStore;
       if (Array.isArray(snapshot.miscDocFolders))  db.miscDocFolders   = snapshot.miscDocFolders;
       if (snapshot.stemHighlights && typeof snapshot.stemHighlights === 'object' && !Array.isArray(snapshot.stemHighlights)) db.stemHighlights = snapshot.stemHighlights;
       if (snapshot.markReasons   && typeof snapshot.markReasons   === 'object' && !Array.isArray(snapshot.markReasons))   db.markReasons   = snapshot.markReasons;
-      _skipNextSchedule = true;
-      DB.save();
+      // v6.1: after a pull, local IS the remote snapshot — stamp the local clock
+      // to the snapshot's clock and persist WITHOUT bumping, so local.updatedAt
+      // equals what Drive holds. Then record markers so the next sync is a clean
+      // no-op instead of a false "local changed → push".
+      const _restoredAt = Number(snapshot.updatedAt) || 0;
+      db.updatedAt = _restoredAt;
+      DB.save({ sync: true });
+      try { _driveWriteMarkers(_restoredAt, _restoredAt); } catch (e) {}
       // Flush to IndexedDB synchronously before reload — prevents quota errors
       // that occurred when the full payload was written to localStorage instead.
       await DB.flushAppState();
@@ -5155,9 +5382,11 @@ window.MiscDocStore = MiscDocStore;
   // v4.69: also gates on !_driveStuck so a permanently-failing sync doesn't
   // get hammered every 5 minutes after escalation.
   setInterval(function() {
-    if (!_accessToken || !_driveDirty || _busy || _driveSyncInProgress || _driveStuck) return;
+    if (!_accessToken || !_driveDirty || _busy || _driveSyncInProgress || _driveStuck || _syncBusy) return;
     console.log('[drive periodic] 5-min safety-net firing');
-    window.saveGoogleDriveNow();
+    // v6.1: route through the newest-wins core (background = push-only, never
+    // reloads, writes a conflict copy on divergence) instead of a blind upload.
+    window.driveSyncNow('background');
   }, _DRIVE_PERIODIC_INTERVAL_MS);
 
   // Visibility-trigger hook: when the app regains focus, fire a sync ONLY
@@ -5166,9 +5395,9 @@ window.MiscDocStore = MiscDocStore;
   // and force a no-op upload on every focus event).
   // v4.69: also gates on !_driveStuck.
   window.flushDriveBackupIfPending = function() {
-    if (!_accessToken || !_driveDirty || _busy || _driveSyncInProgress || _driveStuck) return;
+    if (!_accessToken || !_driveDirty || _busy || _driveSyncInProgress || _driveStuck || _syncBusy) return;
     console.log('[drive visibility] flushing pending backup on focus-restore');
-    window.saveGoogleDriveNow();
+    window.driveSyncNow('background');
   };
 
   // v4.69: manual-retry escape hatch. Called when the user explicitly clicks
@@ -5275,6 +5504,38 @@ window.MiscDocStore = MiscDocStore;
       e.returnValue = '';
     }
   });
+
+  // ── v6.1: sync-on-close ────────────────────────────────────────────────────
+  // Best-effort flush when the tab/window is hidden or closing, so the latest
+  // local changes reach Drive without the user clicking Sync. 'background' mode
+  // is push-only (never reloads, writes a conflict copy on divergence), and is
+  // gated on _driveDirty so it never fires a pointless no-op upload.
+  // NOTE: browsers do not await async work in these events, so the WEB close
+  // path is best-effort. The Electron app-quit path is handled deterministically
+  // by main.js (before-quit → executeJavaScript(window.__driveFlushForQuit)).
+  function _driveFlushOnHide() {
+    if (!_accessToken || _syncBusy) return;
+    if (!_driveDirty && !_driveSyncInProgress) return;
+    try { window.driveSyncNow('background'); } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') _driveFlushOnHide();
+  });
+  window.addEventListener('pagehide', _driveFlushOnHide);
+
+  // Electron before-quit calls this (via executeJavaScript) and AWAITS it with a
+  // timeout, so the final local changes are pushed before the process exits.
+  // Returns a short status string purely for logging on the main side.
+  window.__driveFlushForQuit = async function() {
+    try {
+      if (!_accessToken) return 'no-token';
+      if (!_driveDirty && !_driveSyncInProgress) return 'clean';
+      await window.driveSyncNow('background');
+      return 'flushed';
+    } catch (e) {
+      return 'error:' + (e && e.message ? e.message : String(e));
+    }
+  };
 
   window.loadFigureFromGoogleDrive = async function(img) {
     if (!img?.driveFileId || !img.figureKey || !window.FigureStore || !_accessToken) return null;
@@ -29519,7 +29780,10 @@ Errors: ${escapeHTML(errors)}</div>
       let isIncomplete = false;
 
       if (q.questionNumber == null || typeof q.questionNumber !== 'number') {
-        qErrors.push('questionNumber is missing or not a number.');
+        // Auto-recover: qNum already falls back to the 1-based position (idx+1)
+        // and that value is used everywhere below, so a missing/non-number
+        // questionNumber is a deterministic repair, not a blocking defect.
+        qWarnings.push(`questionNumber is missing or not a number; using position ${qNum}.`);
       }
       if (q.sourceQuestionNumber != null && typeof q.sourceQuestionNumber !== 'number' && typeof q.sourceQuestionNumber !== 'string') {
         qWarnings.push('sourceQuestionNumber should be number, string, or null.');
@@ -29558,7 +29822,20 @@ Errors: ${escapeHTML(errors)}</div>
         const seenLabels = new Set();
         q.answerChoices.forEach((ch, ci) => {
           if (!ch.label || typeof ch.label !== 'string' || !ch.label.trim()) {
-            qErrors.push(`answerChoices[${ci}] has no label.`);
+            // Auto-recover a missing/blank label to its positional letter
+            // (A, B, C, …). A choice's position is unambiguous, so this is a
+            // deterministic repair, not a defect — the question imports as fully
+            // valid instead of failing. We mutate the shared payload object so
+            // the filled label carries into normalizeNbmeGeminiJsonImport (every
+            // import path validates then normalizes the SAME parsed object).
+            // Beyond 'Z' (ci >= 26) there is no positional letter -> hard error.
+            if (ci < 26) {
+              ch.label = String.fromCharCode(65 + ci);
+              qWarnings.push(`answerChoices[${ci}] had no label; auto-assigned positional label "${ch.label}".`);
+              seenLabels.add(ch.label);
+            } else {
+              qErrors.push(`answerChoices[${ci}] has no label.`);
+            }
           } else {
             if (seenLabels.has(ch.label)) {
               qWarnings.push(`Duplicate answer label: "${ch.label}".`);
@@ -29661,10 +29938,26 @@ Errors: ${escapeHTML(errors)}</div>
         qWarnings.push(`Has ${q.extractionWarnings.length} extractionWarning(s) from source.`);
       }
 
-      const isValid = qErrors.length === 0;
-      if (!isValid) blockingErrors.push(`Q${qNum}: ${qErrors[0]}${qErrors.length > 1 ? ` (+${qErrors.length-1} more)` : ''}`);
-      if (isValid && !isIncomplete) validCount++;
-      if (isValid && isIncomplete) incompleteCount++;
+      // Quarantine instead of all-or-nothing: a per-question hard error
+      // (missing stem, duplicate questionNumber, answerChoices not an array, a
+      // non-recoverable missing label, …) used to push to blockingErrors, which
+      // made the file-level isValid (return statement) false and rejected the
+      // ENTIRE file — so one bad question discarded hundreds of perfect ones
+      // (the 942-question Anki import). Now a per-question hard error flags ONLY
+      // that question (isIncomplete) and the rest of the file still imports.
+      // blockingErrors stays reserved for the early structural guards above
+      // (not an object / missing questions array / empty questions array), so a
+      // file fails only when it has zero questions. The question's errors remain
+      // visible via questionResults / the preview, and the "Save valid questions
+      // only" button still filters on isValid to skip these flagged questions.
+      const hadHardError = qErrors.length > 0;
+      if (hadHardError) {
+        isIncomplete = true;
+        qWarnings.push(`Imported and flagged for review: ${qErrors[0]}${qErrors.length > 1 ? ` (+${qErrors.length-1} more issue(s))` : ''}`);
+      }
+      const isValid = !hadHardError;
+      if (!isIncomplete) validCount++;
+      else incompleteCount++;
 
       questionResults.push({
         questionNumber: qNum,

@@ -2614,22 +2614,34 @@ function createWindow() {
     isClosing = true;
 
     try {
-      // Give the renderer up to 3 s to flush Drive sync and localStorage.
-      // saveGoogleDriveNow() is a no-op when no Drive token is present.
-      await Promise.race([
+      // Give the renderer up to 6 s to flush Drive sync and localStorage.
+      // v6.1: route through __driveFlushForQuit() — the newest-wins close path.
+      // It PUSHES local-newer edits, but NEVER overwrites a fresher Drive copy
+      // (the old blind saveGoogleDriveNow() could clobber newer remote data —
+      // the exact data-loss bug we're fixing). On divergence it writes a dated
+      // conflict copy so nothing is lost. Falls back to the old push only if the
+      // new entry point is somehow absent. Bounded by the race timeout so a slow
+      // or offline network can never hang the quit.
+      const flushResult = await Promise.race([
         win.webContents.executeJavaScript(`(async () => {
           try {
+            if (typeof window.__driveFlushForQuit === 'function') {
+              return await window.__driveFlushForQuit();
+            }
             if (typeof window.saveGoogleDriveNow === 'function') {
               await window.saveGoogleDriveNow();
             }
             if (typeof DB !== 'undefined' && typeof DB.save === 'function') {
-              DB.save();
+              DB.save({ sync: true });
             }
-          } catch (_) {}
-          return 'done';
+            return 'legacy-flush';
+          } catch (_) {
+            return 'flush-error';
+          }
         })()`),
-        new Promise(resolve => setTimeout(resolve, 3000))
+        new Promise(resolve => setTimeout(() => resolve('timeout'), 6000))
       ]);
+      console.log('[NBME] Drive flush on close:', flushResult);
     } catch (err) {
       console.error('[NBME] State flush failed on close:', err.message);
     }
