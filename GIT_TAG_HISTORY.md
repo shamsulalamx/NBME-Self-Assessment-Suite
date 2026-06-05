@@ -1,14 +1,48 @@
 # Git Tag History
 
-Last updated: 2026-06-03
+Last updated: 2026-06-05
 
-This file documents stable tags through the current head tag `v5.12-batch5-stable`. Each entry records the commit, what was added or stabilized, what evidence supports it, and what architectural significance it carries. The full v5 (Batch 5 organic-generator) lineage — v5.0 through v5.10, with per-version detail — lives in `BATCH5_STATUS.md`; only the current v5 head tag is mirrored here.
+This file documents tags through the current head tag `v6.1-drive-sync-answer-balance-pending-validation`. Each entry records the commit, what was added or stabilized, what evidence supports it, and what architectural significance it carries. The full v5 (Batch 5 organic-generator) lineage — v5.0 through v5.10, with per-version detail — lives in `BATCH5_STATUS.md`; only the current v5 head tag is mirrored here.
 
 Note on the recent v4.62–v4.80 batch: many of these tags shipped with source-level proof only (`node --check` clean + `.app` rebuilt + bundled-marker count). That is NOT verification of behavior, and several of those tags introduced regressions caught only when the user exercised the scenarios live. v4.80.1 codified this as a binding rule via the new `CLAUDE.md` working-agreement file: no `-stable` suffix without user click-through verification. v4.80.2 follows that rule — tag earned via real "Detected 1 NBME pair" UI confirmation by the user after re-selecting files in the rebuilt .app.
 
+## v6.1-drive-sync-answer-balance-pending-validation
+
+Current head tag. Tagged `-pending-validation` on 2026-06-05 at the user's explicit instruction ("Update docs, commit, tag, push everywhere so the changes are effective now on the .app and on browser on a different computer. If problems arise in the future, I will bring it up"). The user explicitly **waived the pre-deploy verification gate** for this milestone and accepted that issues surface through real use — but did NOT say "as stable," so per the binding CLAUDE.md rule (never auto-promote) this stays `-pending-validation` until the user says the word. The code is **fully live regardless of the suffix**: the site rebuilds from pushed `phase12-vertex-migration` and the `.app` was rebuilt this session (source↔bundle MD5 match on `index.html` + `electron/main.js`).
+
+This tag bundles two headline features the user requested, plus the accumulated uncommitted tools work that was already sitting in the `phase12` working tree.
+
+Commits (on `phase12-vertex-migration`):
+1. **Drive single-sync redesign (v6.1)** — `index.html` + `electron/main.js`.
+2. **Answer-position balancer (v6.0) + in-tree generator work** — `tools/uworld-notes-question-generator/generate_uworld_questions.py` (the A-bias balancer, entangled in the same file with v5.12.x BIC emission) + the four `tools/shared-ingestion/*_profile_runner.py` + `tools/divine-audio-question-generator/generate_divine_questions.py` (v5.12.x BIC live progress) + `tools/lecture-slide-question-generator/v5_pipeline.py` (v5.7 image-relevance gate + quota backoff).
+3. **Docs** — this entry.
+
+Meaning — the two headline features:
+
+1. **Drive single-sync redesign (v6.1) — the data-loss fix.** The reported data loss came from auto-connect blindly UPLOADING a STALE local DB over a FRESHER Drive backup. Blind-overwrite is replaced with **newest-wins**: a persistent `db.updatedAt` epoch-ms mutation clock (bumped on every real `save()`, stamped into the Drive snapshot) plus per-device reconciliation markers (`nbme_drive_sync_local_at_v1` / `nbme_drive_sync_remote_at_v1`) recording the (localAt, remoteAt) pair at the last successful sync. A single decision core (`_driveDecideAction`) compares them to choose push / pull / noop / conflict; three wrappers specialize it by context — `_driveDecideAuto` (boot/periodic: never destructive, conflict→defer) and `_driveDecideClose` (quit/hide: push local-newer, never auto-pull, conflict→dated conflict-copy). The decision logic was proven 21/21 in a standalone Node harness BEFORE any wiring. UI: one **🔄 Sync Now** button (`driveSyncNow('manual')`) in Settings; Connect kept for first-time auth; Force Backup/Restore/Debug moved under an Advanced disclosure. Auto-sync now runs on boot (`autoConnectGoogleDrive` → `driveSyncNow('auto')`, replacing the buggy blind upload), on tab-hide/pagehide (best-effort), and on Electron app-quit (`win.on('close')` → `executeJavaScript(window.__driveFlushForQuit)`, 6 s-bounded so it can never hang quit). `DB.save({sync:true})` persists sync-housekeeping writes WITHOUT bumping the clock, keeping local==remote after a push/pull so the next sync is a true no-op. Conflict-copies (`nbme_manifest.conflict-<ts>.json`) ensure nothing is ever destroyed even on divergence.
+
+2. **Permanent answer-position balancer (v6.0) — the "always-A" fix for future organic questions.** At the single `build_app_ready_json` chokepoint in `generate_uworld_questions.py` — which every normal-mode organic generator (Anki, uWorld-notes, Mehlman, OME, Divine) routes through — `balance_answer_positions()` de-biases correct-answer position with a deterministic per-file seeded shuffle (≈25% A/B/C/D) AND relabels any answer-choice letters embedded in explanation prose in lockstep. Each per-question relabel is PROVEN before commit (positional verify + inverse round-trip); if a question can't be proven safe it is left byte-for-byte untouched (never corrupted). Medical look-alikes (Hemophilia A, Vitamin C, hepatitis B/C) are protected by a guard regex. It **skips** v5/Advanced questions (the `_v5_2` marker — their distribution gate already balances them) and never touches the NBME/AMBOSS verbatim extractors. Env kill-switch `ANSWER_BALANCE_ENABLED`. Self-proven: 26/26 unit tests; the existing 942-question Peds Anki set went A:769 → A:236/B:236/C:235/D:235 with 0 corruption.
+
+Also riding in this tag (accumulated uncommitted tree work, NOT authored this session, py_compile-clean):
+- **v5.12.x BIC live-progress streaming** in the four uworld-family profile runners + Divine: `subprocess.run(PIPE)` → `subprocess.Popen` with `stderr=STDOUT` and a live line drain that forwards child `BIC_PROGRESS` lines in real time (the old buffering surfaced output only after the child exited, so the bar never moved), plus `_emit_bic_progress` in Divine's legacy loop.
+- **v5.7 image-relevance gate + quota backoff** in `v5_pipeline.py`.
+
+Validated (static + self-test only; the user explicitly waived pre-deploy click-through):
+1. `node --check` clean on `electron/main.js`; all 11 inline `<script>` blocks in `index.html` parse clean (vm.Script per extracted block).
+2. `python3 -m py_compile` clean on all 7 modified Python files.
+3. Drive decision core proven 21/21 in a standalone Node harness (topology, marker-based change detection, the stale-local-vs-fresh-remote bug-fix scenario, and the auto/close wrappers).
+4. Answer balancer self-proven 26/26 + the 942-question dataset (0 corruption).
+5. Scope verified: all new Drive functions sit inside the Drive IIFE (`index.html` 4402–5549); `save(opts)` inside the DB IIFE (3536–4107). `.app` rebuilt; source↔bundle MD5 match on `index.html` + `electron/main.js`.
+
+Not validated by this milestone (caveat accepted via the explicit "make it effective now, I'll bring up problems" instruction):
+- No in-app click-through of the new Sync button / boot auto-sync / quit-flush in the rebuilt `.app`, and no real cross-device Drive sync run.
+- No fresh live generation run to confirm the balancer on live Gemini output (the 942-set proof is on already-generated data).
+
+Architecture significance: The Drive core establishes a **proven-in-isolation decision brain** (a pure function, exhaustively unit-tested in Node) wired into the app only after it passed — the inverse of the historical "static-check ≠ behavior" failures. The balancer reinforces the **single-chokepoint fan-out** (`build_app_ready_json` — one function balances every organic generator at once) and the **prove-then-commit** discipline (positional verify + inverse round-trip; unprovable → leave untouched) so a relabel can never silently corrupt an explanation.
+
 ## v5.12-batch5-stable
 
-Current head tag. Promoted to `-stable` on 2026-06-03 at the user's explicit instruction ("update docs, commit, tag, push everywhere as stable, including the changes you made for fast facts") — the same standing instruction that promoted v5.10. This stable tag bundles the v5.11 + v5.12 work on `phase12-vertex-migration` and supersedes everything added to the working tree since `v5.10-batch5-stable`. Five independent improvements ride in it; none touch the NBME/AMBOSS verbatim paths.
+Promoted to `-stable` on 2026-06-03 at the user's explicit instruction ("update docs, commit, tag, push everywhere as stable, including the changes you made for fast facts") — the same standing instruction that promoted v5.10. This stable tag bundles the v5.11 + v5.12 work on `phase12-vertex-migration` and supersedes everything added to the working tree since `v5.10-batch5-stable`. Five independent improvements ride in it; none touch the NBME/AMBOSS verbatim paths.
 
 Commit: single v5.12 commit bundling `index.html` + `core/uoga/chunk_cache.py` (new) + `tools/lecture-slide-question-generator/generate_lecture_slide_questions.py` + `tools/lecture-slide-question-generator/v5_pipeline.py` + `tools/mehlman-pdf-question-generator/generate_mehlman_questions.py` + `tools/shared-ingestion/mehlman_profile_runner.py` + `tools/uworld-notes-question-generator/generate_uworld_questions.py` + `BATCH5_STATUS.md` + this entry, on `phase12-vertex-migration`.
 
